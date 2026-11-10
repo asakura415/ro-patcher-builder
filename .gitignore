@@ -1,0 +1,37 @@
+# Internal planning docs
+/PROJECT_PLAN.md
+
+# Compiled binaries & libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / Web dependencies
+node_modules/
+dist/
+
+# Test environments and temporary directories
+/test_env/
+*.log
+*.tmp
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

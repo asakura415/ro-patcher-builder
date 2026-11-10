@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modern Ragnarok Patcher</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="patcher-window">
+        <!-- Titlebar -->
+        <header class="titlebar" data-patcher-drag>
+            <div class="server-badge">
+                <span class="status-indicator online"></span>
+                <span class="server-title" id="serverTitle">PRONTERA BOX</span>
+            </div>
+            <div class="window-controls no-drag">
+                <button class="win-btn minimize no-drag" onclick="window.PatcherAPI && window.PatcherAPI.minimize()">&#8211;</button>
+                <button class="win-btn close no-drag" onclick="window.PatcherAPI && window.PatcherAPI.close()">&#10005;</button>
+            </div>
+        </header>
+
+        <!-- Main Body -->
+        <main class="main-content">
+            <!-- News / Banner Section -->
+            <section class="news-container">
+                <div class="news-banner">
+                    <div class="banner-overlay">
+                        <span class="banner-tag">EPISODE UPDATE</span>
+                        <h2 class="banner-title">Welcome to PRONTERA BOX</h2>
+                        <p class="banner-subtitle">Experience high-speed downloads, secure memory safety, and seamless GRF patching.</p>
+                    </div>
+                </div>
+                
+                <div class="notice-links">
+                    <a href="https://discord.gg" target="_blank" class="notice-item">
+                        <span class="notice-badge news">DISCORD</span>
+                        <span class="notice-text">Join the community on Discord for live events!</span>
+                    </a>
+                    <a href="#" class="notice-item">
+                        <span class="notice-badge event">EVENT</span>
+                        <span class="notice-text">Double EXP & Drop Rate Weekend is now live.</span>
+                    </a>
+                </div>
+            </section>
+
+            <!-- Patch Progress & Controls Section -->
+            <footer class="footer-controls">
+                <div class="progress-section">
+                    <div class="status-header">
+                        <span class="status-label" id="statusText">Checking for updates...</span>
+                        <span class="status-percentage" id="percentText">0%</span>
+                    </div>
+
+                    <div class="progress-track">
+                        <div class="progress-bar-fill" id="progressFill"></div>
+                    </div>
+
+                    <div class="status-details">
+                        <span class="detail-file" id="detailFile">Connecting to patch server...</span>
+                        <span class="detail-speed" id="detailSpeed">0.0 MB/s</span>
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn btn-secondary" onclick="window.PatcherAPI && window.PatcherAPI.openSetup()">
+                        <span class="btn-icon">&#9881;</span> Setup
+                    </button>
+                    <button class="btn btn-secondary" onclick="window.PatcherAPI && window.PatcherAPI.forceRepatch()">
+                        <span class="btn-icon">&#8635;</span> Repair
+                    </button>
+                    <button class="btn btn-primary" id="btnPlay" onclick="window.PatcherAPI && window.PatcherAPI.startGame()" disabled>
+                        <span class="btn-icon">&#9654;</span> START GAME
+                    </button>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/gruf",
+    "crates/patcher-core",
+    "crates/patcher-template",
+    "crates/patch-maker",
+    "apps/patcher-builder/src-tauri",
+]
+resolver = "2"

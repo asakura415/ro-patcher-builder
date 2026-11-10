@@ -1,0 +1,32 @@
+[package]
+name = "patcher-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Antigravity"]
+description = "Core patching engine for Modern RO Patcher"
+
+[dependencies]
+gruf = { path = "../gruf" }
+
+tokio = { version = "1.40", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+futures = "0.3"
+url = "2.5"
+tempfile = "3.2"
+log = "0.4"
+thiserror = "1.0"
+anyhow = "1.0"
+fs2 = "0.4"
+scopeguard = "1.2"
+sha2 = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+walkdir = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["winbase", "libloaderapi", "winuser"] }
+
+[dev-dependencies]
+httptest = "0.15"
