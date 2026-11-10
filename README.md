@@ -60,7 +60,7 @@ Legacy Ragnarok Online patchers (such as Thor Patcher, NeonCube, and old Delphi/
 ## 📐 Workspace Architecture
 
 ```
-patcher-builder/
+ro-patcher-builder/
 ├── apps/
 │   └── patcher-builder/        # Visual Desktop GUI Builder (Tauri v2 + Vanilla HTML/CSS/JS)
 │       ├── src/                # Modern UI Frontend (Themes, i18n, Form Handlers)
@@ -119,8 +119,8 @@ patcher-builder/
 
 Clone the repository:
 ```bash
-git clone https://github.com/asakura415/modern-ro-patcher.git
-cd modern-ro-patcher
+git clone https://github.com/asakura415/ro-patcher-builder.git
+cd ro-patcher-builder
 ```
 
 Run test suite:
@@ -169,7 +169,7 @@ Format:
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome!
-Feel free to check [issues page](https://github.com/asakura415/modern-ro-patcher/issues) if you want to contribute.
+Feel free to check [issues page](https://github.com/asakura415/ro-patcher-builder/issues) if you want to contribute.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
