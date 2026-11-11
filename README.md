@@ -73,7 +73,8 @@ ro-patcher-builder/
 │   └── gruf/                   # High-performance GRF v2.0 and THOR archive reader/writer
 │
 ├── themes/
-│   └── modern-cyber/           # Sleek cyberpunk neon web theme (HTML/CSS/JS)
+│   ├── modern-cyber/           # Sleek cyberpunk neon web theme (HTML/CSS/JS)
+│   └── anime-sakura/           # Japanese anime sakura fantasy web theme (HTML/CSS/JS)
 │
 ├── template-dist/
 │   ├── patcher_base.exe        # Pre-built base template binary for rapid generator packaging

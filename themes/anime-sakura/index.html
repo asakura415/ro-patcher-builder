@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sakura Anime Patcher</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Sakura Petals Canvas Background -->
+    <canvas id="sakuraCanvas"></canvas>
+
+    <div class="patcher-window">
+        <!-- Titlebar -->
+        <header class="titlebar" data-patcher-drag>
+            <div class="server-badge">
+                <span class="sakura-icon">🌸</span>
+                <span class="server-title" id="serverTitle">PRONTERA BOX</span>
+                <span class="server-jp-tag">桜ファンタジー</span>
+                <span class="status-indicator online" title="Server Online"></span>
+            </div>
+            <div class="window-controls no-drag">
+                <button class="win-btn sound-toggle no-drag" id="btnSoundToggle" title="Toggle Sound">&#128266;</button>
+                <button class="win-btn minimize no-drag" onclick="window.PatcherAPI && window.PatcherAPI.minimize()" title="Minimize">&#8211;</button>
+                <button class="win-btn close no-drag" onclick="window.PatcherAPI && window.PatcherAPI.close()" title="Close">&#10005;</button>
+            </div>
+        </header>
+
+        <!-- Main Body -->
+        <main class="main-content">
+            <!-- Top Hero Grid: Banner + Mascot -->
+            <section class="hero-grid">
+                <!-- News Banner -->
+                <div class="news-banner">
+                    <img src="assets/banner.jpg" alt="Episode Banner" class="banner-img">
+                    <div class="banner-gradient"></div>
+                    <div class="banner-overlay">
+                        <div class="banner-badges">
+                            <span class="badge-sakura">🌸 EPISODE UPDATE</span>
+                            <span class="badge-edition">Ver. 2.0 Anime Edition</span>
+                        </div>
+                        <h2 class="banner-title">Welcome to PRONTERA BOX</h2>
+                        <p class="banner-subtitle">สัมผัสประสบการณ์ผจญภัยในโลกเวทมนตร์ ดาวน์โหลดแพตช์ความเร็วสูง ลื่นไหล มั่นคง ปลอดภัย</p>
+                    </div>
+                </div>
+
+                <!-- Mascot Greeting Card -->
+                <div class="mascot-card">
+                    <div class="mascot-img-wrap">
+                        <img src="assets/mascot.jpg" alt="Patcher Mascot Priestess" class="mascot-img">
+                    </div>
+                    <div class="mascot-bubble">
+                        <span class="bubble-sparkle">✨</span>
+                        <p class="bubble-text">「冒険の旅へ出かけよう！」<br><small>ยินดีต้อนรับเหล่านักผจญภัยทุกท่าน!</small></p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Notice & Event Board -->
+            <section class="notice-board">
+                <div class="notice-header">
+                    <span class="notice-title-icon">📢</span>
+                    <span class="notice-title-text">NOTICES & EVENTS • お知らせ</span>
+                </div>
+                <div class="notice-list">
+                    <a href="https://discord.gg" target="_blank" class="notice-item">
+                        <span class="notice-badge badge-discord">DISCORD</span>
+                        <span class="notice-text">เข้าร่วม Official Discord เพื่อรับข่าวสาร กิจกรรม และแจกไอเทมพิเศษ</span>
+                        <span class="notice-date">NEW</span>
+                    </a>
+                    <a href="#" target="_blank" class="notice-item" id="noticeLinkItem">
+                        <span class="notice-badge badge-event">EVENT</span>
+                        <span class="notice-text">เทศกาลดอกซากุระบาน! Double EXP & Drop Rate ตลอดสุดสัปดาห์นี้</span>
+                        <span class="notice-date">HOT</span>
+                    </a>
+                </div>
+            </section>
+
+            <!-- Patch Progress & Action Controls -->
+            <footer class="footer-controls">
+                <div class="progress-section">
+                    <div class="status-header">
+                        <div class="status-label-group">
+                            <span class="status-dot"></span>
+                            <span class="status-label" id="statusText">กำลังตรวจสอบการอัปเดต... (Checking updates)</span>
+                        </div>
+                        <span class="status-percentage" id="percentText">0%</span>
+                    </div>
+
+                    <div class="progress-track">
+                        <div class="progress-bar-fill" id="progressFill">
+                            <div class="progress-shimmer"></div>
+                        </div>
+                    </div>
+
+                    <div class="status-details">
+                        <span class="detail-file" id="detailFile">กำลังเชื่อมต่อไปยังเซิร์ฟเวอร์แพตช์...</span>
+                        <span class="detail-speed" id="detailSpeed">0.0 MB/s</span>
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn btn-secondary sound-click" onclick="window.PatcherAPI && window.PatcherAPI.openSetup()" title="Settings">
+                        <span class="btn-icon">⚙️</span>
+                        <span class="btn-text">ตั้งค่า</span>
+                    </button>
+                    <button class="btn btn-secondary sound-click" onclick="window.PatcherAPI && window.PatcherAPI.forceRepatch()" title="Repair Game Files">
+                        <span class="btn-icon">🔄</span>
+                        <span class="btn-text">ซ่อมแซม</span>
+                    </button>
+                    <button class="btn btn-primary sound-click" id="btnPlay" onclick="window.PatcherAPI && window.PatcherAPI.startGame()" disabled>
+                        <span class="btn-play-icon">▶</span>
+                        <div class="btn-play-text">
+                            <span class="play-main">START GAME</span>
+                            <span class="play-sub">ゲーム開始</span>
+                        </div>
+                    </button>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

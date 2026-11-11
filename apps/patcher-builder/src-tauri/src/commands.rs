@@ -192,6 +192,8 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
     // 4. Resolve Web Theme folder
     let theme_folder = match req.theme_folder_path {
         Some(ref p) if Path::new(p).exists() => PathBuf::from(p),
+        Some(ref p) if Path::new(&format!("../{}", p)).exists() => PathBuf::from(&format!("../{}", p)),
+        Some(ref p) if Path::new(&format!("../../{}", p)).exists() => PathBuf::from(&format!("../../{}", p)),
         _ => {
             let possible_themes = [
                 PathBuf::from("themes/modern-cyber"),

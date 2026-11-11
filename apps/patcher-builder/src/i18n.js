@@ -71,6 +71,8 @@ const I18N = {
             cardThemeTemplate: "Web Theme Template",
             themeCyberTitle: "Modern Cyber Neon (Default)",
             themeCyberDesc: "Sleek glassmorphism, glowing neon accents, and smooth animated progress.",
+            themeAnimeTitle: "Sakura Anime Fantasy",
+            themeAnimeDesc: "Japanese anime fantasy style, floating sakura petals, sweet sound effects, and mascot artwork.",
             labelCustomThemeFolder: "Or Custom Web Theme Folder Path",
 
             // Tab 4: Patch Maker
@@ -221,6 +223,8 @@ const I18N = {
             cardThemeTemplate: "การเลือกธีมหน้าตาของ Patcher",
             themeCyberTitle: "Modern Cyber Neon (ธีมมาตรฐาน)",
             themeCyberDesc: "สไตล์ Glassmorphism ดีไซน์นีออนเรืองแสง พร้อมหลอดดาวน์โหลดเคลื่อนไหวสมูท",
+            themeAnimeTitle: "Sakura Anime Fantasy (ธีมอนิเมะญี่ปุ่น)",
+            themeAnimeDesc: "สไตล์อนิเมะแฟนตาซี กลีบซากุระร่วงปลิวสมจริง เอฟเฟกต์เสียงน่ารัก พร้อมภาพมาสคอตและแบนเนอร์สวยงาม",
             labelCustomThemeFolder: "หรือเลือกโฟลเดอร์ธีมแบบกำหนดเอง (HTML/CSS)",
 
             // Tab 4: Patch Maker

@@ -522,7 +522,13 @@ document.addEventListener("DOMContentLoaded", async function() {
         };
 
         const customIcon = document.getElementById("customIcon").value.trim();
-        const customTheme = document.getElementById("customThemeFolder").value.trim();
+        let customTheme = document.getElementById("customThemeFolder").value.trim();
+        if (!customTheme) {
+            const activeCard = document.querySelector(".theme-card.active");
+            if (activeCard) {
+                customTheme = activeCard.getAttribute("data-theme") || "";
+            }
+        }
         const outputPath = document.getElementById("genOutputPath").value.trim();
         const templatePath = document.getElementById("genTemplatePath").value.trim();
 
@@ -611,6 +617,34 @@ document.addEventListener("DOMContentLoaded", async function() {
     // Initialize I18N
     if (window.I18N) {
         window.I18N.init();
+    }
+
+    // --- Theme Card Selection ---
+    const themeCards = document.querySelectorAll(".theme-card");
+    const customThemeFolderInput = document.getElementById("customThemeFolder");
+    themeCards.forEach(card => {
+        card.addEventListener("click", () => {
+            themeCards.forEach(c => c.classList.remove("active"));
+            card.classList.add("active");
+            const themePath = card.getAttribute("data-theme");
+            if (customThemeFolderInput) {
+                customThemeFolderInput.value = themePath;
+            }
+        });
+    });
+
+    if (customThemeFolderInput) {
+        customThemeFolderInput.addEventListener("input", () => {
+            const val = customThemeFolderInput.value.trim().replace(/\\/g, "/");
+            themeCards.forEach(card => {
+                const cardTheme = card.getAttribute("data-theme");
+                if (val === cardTheme || val.endsWith(cardTheme)) {
+                    card.classList.add("active");
+                } else {
+                    card.classList.remove("active");
+                }
+            });
+        });
     }
 
     // --- File / Folder Browse Buttons ---
