@@ -1,10 +1,13 @@
 // Modern RO Patcher Builder Frontend Logic
 document.addEventListener("DOMContentLoaded", async function() {
-    // Check Tauri API
-    const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, args) => {
-        console.warn("Tauri invoke simulated:", cmd, args);
-        return {};
-    };
+    // Check Tauri API (supports both Global Tauri v2 and Tauri Internals IPC)
+    const invoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
+        ? window.__TAURI__.core.invoke
+        : (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+            ? window.__TAURI_INTERNALS__.invoke
+            : async (cmd, args) => {
+                throw new Error(`Tauri IPC runtime is not available when invoking '${cmd}'`);
+            };
 
     // Tab Navigation
     const navItems = document.querySelectorAll(".nav-item");
@@ -532,6 +535,17 @@ document.addEventListener("DOMContentLoaded", async function() {
         const outputPath = document.getElementById("genOutputPath").value.trim();
         const templatePath = document.getElementById("genTemplatePath").value.trim();
 
+        if (!outputPath) {
+            genBanner.style.display = "flex";
+            genBanner.style.borderColor = "#e53e3e";
+            resTitle.innerText = "Build Failed";
+            resDesc.innerText = "Please specify an Output Executable Destination (.exe).";
+            resMeta.innerText = "";
+            btnGenerate.innerHTML = "<span>&#128640;</span> GENERATE STANDALONE PATCHER (.EXE)";
+            btnGenerate.disabled = false;
+            return;
+        }
+
         try {
             const res = await invoke("generate_patcher", {
                 req: {
@@ -542,6 +556,10 @@ document.addEventListener("DOMContentLoaded", async function() {
                     theme_folder_path: customTheme || null
                 }
             });
+
+            if (!res || !res.success) {
+                throw new Error((res && res.message) ? res.message : "Failed to generate standalone patcher.");
+            }
 
             genBanner.style.display = "flex";
             genBanner.style.borderColor = "#48bb78";
@@ -652,16 +670,22 @@ document.addEventListener("DOMContentLoaded", async function() {
         btn.addEventListener("click", async () => {
             const targetId = btn.getAttribute("data-browse-target");
             const mode = btn.getAttribute("data-browse-mode") || "folder";
+            const inputEl = targetId ? document.getElementById(targetId) : null;
+            const currentPath = inputEl ? inputEl.value.trim() : "";
+            const prevText = btn.innerText;
+            btn.disabled = true;
             try {
-                const selected = await invoke("pick_path", { mode });
-                if (selected && targetId) {
-                    const inputEl = document.getElementById(targetId);
-                    if (inputEl) {
-                        inputEl.value = selected;
-                    }
+                const selected = await invoke("pick_path", { mode, currentPath });
+                if (typeof selected === "string" && selected.trim().length > 0 && inputEl) {
+                    inputEl.value = selected.trim();
+                    inputEl.dispatchEvent(new Event("input", { bubbles: true }));
                 }
             } catch (err) {
                 console.error("Browse dialog failed:", err);
+                alert("Failed to open file/folder dialog: " + err);
+            } finally {
+                btn.disabled = false;
+                btn.innerText = prevText;
             }
         });
     });

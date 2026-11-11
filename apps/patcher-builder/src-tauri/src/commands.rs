@@ -131,56 +131,105 @@ pub fn scan_game_directory(dir_path: String) -> Result<GameDirScanResult, String
     })
 }
 
+/// Resolves a candidate relative or absolute path by checking:
+/// 1. The path directly
+/// 2. Relative to `std::env::current_dir()` and up to 4 ancestor directories
+/// 3. Relative to `std::env::current_exe()` parent directory and up to 4 ancestor directories
+fn resolve_project_path(rel_or_abs: &str) -> Option<PathBuf> {
+    let trimmed = rel_or_abs.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let direct = PathBuf::from(trimmed);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let mut base_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: Option<&Path> = Some(cwd.as_path());
+        for _ in 0..5 {
+            if let Some(d) = cur {
+                base_dirs.push(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur: Option<&Path> = exe.parent();
+        for _ in 0..5 {
+            if let Some(d) = cur {
+                if !base_dirs.contains(&d.to_path_buf()) {
+                    base_dirs.push(d.to_path_buf());
+                }
+                cur = d.parent();
+            }
+        }
+    }
+
+    for base in base_dirs {
+        let candidate = base.join(trimmed);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 #[tauri::command]
 pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherResponse, String> {
     log::info!("Generating patcher to {:?}", req.output_exe_path);
 
-    // 1. Locate patcher_base.exe template
-    let base_template = match req.template_exe_path {
-        Some(ref p) if Path::new(p).exists() => PathBuf::from(p),
-        _ => {
-            let possible_paths = [
-                PathBuf::from("template-dist/patcher_base.exe"),
-                PathBuf::from("../template-dist/patcher_base.exe"),
-                PathBuf::from("../../template-dist/patcher_base.exe"),
-                PathBuf::from("target/release/patcher-template.exe"),
-                PathBuf::from("../target/release/patcher-template.exe"),
-                PathBuf::from("../../target/release/patcher-template.exe"),
-            ];
+    if req.output_exe_path.trim().is_empty() {
+        return Err("Output executable path cannot be empty.".to_string());
+    }
 
-            possible_paths
-                .iter()
-                .find(|p| p.exists())
-                .cloned()
-                .ok_or_else(|| {
-                    "Could not find patcher_base.exe template. Please compile patcher-template first."
-                        .to_string()
-                })?
-        }
+    // 1. Locate patcher_base.exe template
+    let base_template = req
+        .template_exe_path
+        .as_deref()
+        .and_then(resolve_project_path)
+        .or_else(|| resolve_project_path("template-dist/patcher_base.exe"))
+        .or_else(|| resolve_project_path("target/release/patcher-template.exe"))
+        .or_else(|| resolve_project_path("target/debug/patcher-template.exe"))
+        .ok_or_else(|| {
+            "Could not find patcher_base.exe template. Please ensure template-dist/patcher_base.exe exists."
+                .to_string()
+        })?;
+
+    let raw_output = PathBuf::from(req.output_exe_path.trim());
+    let output_path = if raw_output.is_absolute() {
+        raw_output
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(raw_output)
+    } else {
+        raw_output
     };
 
-    let output_path = PathBuf::from(&req.output_exe_path);
     if let Some(parent) = output_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create output directory {:?}: {:#}", parent, e))?;
+        }
     }
 
     // 2. Copy base template to target output file
-    fs::copy(&base_template, &output_path)
-        .map_err(|e| format!("Failed to copy patcher base template: {:#}", e))?;
+    fs::copy(&base_template, &output_path).map_err(|e| {
+        format!(
+            "Failed to copy patcher base template from {:?} to {:?}: {:#}",
+            base_template, output_path, e
+        )
+    })?;
 
     // 3. (CRITICAL) Update PE Resource (icon) BEFORE appending binary overlay
-    let icon_to_apply: Option<PathBuf> = match req.custom_icon_path {
-        Some(ref p) if !p.trim().is_empty() && Path::new(p).exists() => Some(PathBuf::from(p)),
-        _ => {
-            let default_icons = [
-                PathBuf::from("template-dist/default_icon.ico"),
-                PathBuf::from("../template-dist/default_icon.ico"),
-                PathBuf::from("../../template-dist/default_icon.ico"),
-                PathBuf::from("apps/patcher-builder/src-tauri/icons/icon.ico"),
-            ];
-            default_icons.into_iter().find(|p| p.exists())
-        }
-    };
+    let icon_to_apply: Option<PathBuf> = req
+        .custom_icon_path
+        .as_deref()
+        .and_then(resolve_project_path)
+        .or_else(|| resolve_project_path("template-dist/default_icon.ico"))
+        .or_else(|| resolve_project_path("apps/patcher-builder/src-tauri/icons/icon.ico"));
 
     if let Some(ref ico_path) = icon_to_apply {
         log::info!("Updating executable icon from {:?}", ico_path);
@@ -190,23 +239,17 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
     }
 
     // 4. Resolve Web Theme folder
-    let theme_folder = match req.theme_folder_path {
-        Some(ref p) if Path::new(p).exists() => PathBuf::from(p),
-        Some(ref p) if Path::new(&format!("../{}", p)).exists() => PathBuf::from(&format!("../{}", p)),
-        Some(ref p) if Path::new(&format!("../../{}", p)).exists() => PathBuf::from(&format!("../../{}", p)),
-        _ => {
-            let possible_themes = [
-                PathBuf::from("themes/modern-cyber"),
-                PathBuf::from("../themes/modern-cyber"),
-                PathBuf::from("../../themes/modern-cyber"),
-            ];
-            possible_themes
-                .iter()
-                .find(|p| p.exists())
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("themes/modern-cyber"))
-        }
-    };
+    let theme_folder = req
+        .theme_folder_path
+        .as_deref()
+        .and_then(resolve_project_path)
+        .or_else(|| resolve_project_path("themes/modern-cyber"))
+        .ok_or_else(|| {
+            format!(
+                "Could not find theme folder {:?}. Please select a valid theme folder.",
+                req.theme_folder_path
+            )
+        })?;
 
     // 5. Create in-memory ZIP payload
     let payload = create_overlay_zip(&req.config, &theme_folder)
@@ -220,9 +263,15 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
         .map_err(|e| format!("Failed to query output metadata: {:#}", e))?;
 
     let size = metadata.len();
+    let display_path = fs::canonicalize(&output_path)
+        .unwrap_or_else(|_| output_path.clone())
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+
     Ok(GeneratePatcherResponse {
         success: true,
-        output_path: output_path.to_string_lossy().to_string(),
+        output_path: display_path.clone(),
         file_size_bytes: size,
         message: format!(
             "Successfully generated standalone patcher! Output: {} ({:.2} MB)",
@@ -388,78 +437,416 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+mod win32_dialog {
+    use std::ffi::{c_void, OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct OPENFILENAMEW {
+        lStructSize: u32,
+        hwndOwner: isize,
+        hInstance: isize,
+        lpstrFilter: *const u16,
+        lpstrCustomFilter: *mut u16,
+        nMaxCustFilter: u32,
+        nFilterIndex: u32,
+        lpstrFile: *mut u16,
+        nMaxFile: u32,
+        lpstrFileTitle: *mut u16,
+        nMaxFileTitle: u32,
+        lpstrInitialDir: *const u16,
+        lpstrTitle: *const u16,
+        Flags: u32,
+        nFileOffset: u16,
+        nFileExtension: u16,
+        lpstrDefExt: *const u16,
+        lCustData: isize,
+        lpfnHook: isize,
+        lpTemplateName: *const u16,
+        pvReserved: *mut c_void,
+        dwReserved: u32,
+        FlagsEx: u32,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct BROWSEINFOW {
+        hwndOwner: isize,
+        pidlRoot: *const c_void,
+        pszDisplayName: *mut u16,
+        lpszTitle: *const u16,
+        ulFlags: u32,
+        lpfn: Option<unsafe extern "system" fn(isize, u32, isize, isize) -> i32>,
+        lParam: isize,
+        iImage: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+
+    #[link(name = "comdlg32")]
+    extern "system" {
+        fn GetOpenFileNameW(lpofn: *mut OPENFILENAMEW) -> i32;
+        fn GetSaveFileNameW(lpofn: *mut OPENFILENAMEW) -> i32;
+        fn CommDlgExtendedError() -> u32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHBrowseForFolderW(lpbi: *mut BROWSEINFOW) -> *mut c_void;
+        fn SHGetPathFromIDListW(pidl: *const c_void, pszPath: *mut u16) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: u32) -> i32;
+        fn CoUninitialize();
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+
+    const OFN_OVERWRITEPROMPT: u32 = 0x00000002;
+    const OFN_NOCHANGEDIR: u32 = 0x00000008;
+    const OFN_PATHMUSTEXIST: u32 = 0x00000800;
+    const OFN_FILEMUSTEXIST: u32 = 0x00001000;
+    const OFN_EXPLORER: u32 = 0x00080000;
+
+    const BIF_RETURNONLYFSDIRS: u32 = 0x00000001;
+    const BIF_EDITBOX: u32 = 0x00000010;
+    const BIF_NEWDIALOGSTYLE: u32 = 0x00000040;
+    const BFFM_INITIALIZED: u32 = 1;
+    const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
+
+    unsafe extern "system" fn browse_callback(
+        hwnd: isize,
+        u_msg: u32,
+        _l_param: isize,
+        lp_data: isize,
+    ) -> i32 {
+        if u_msg == BFFM_INITIALIZED && lp_data != 0 {
+            SendMessageW(hwnd, BFFM_SETSELECTIONW, 1, lp_data);
+        }
+        0
+    }
+
+    fn to_wide_null(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn from_wide_buf(buf: &[u16]) -> String {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        OsString::from_wide(&buf[..len]).to_string_lossy().to_string()
+    }
+
+    pub fn show_folder_dialog(owner_hwnd: isize, initial_dir: Option<&Path>) -> Option<String> {
+        unsafe {
+            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
+            let hwnd = if owner_hwnd != 0 {
+                owner_hwnd
+            } else {
+                GetForegroundWindow()
+            };
+            let mut display_buf = vec![0u16; 260];
+            let title = to_wide_null("Select Folder");
+            let init_wide = initial_dir
+                .filter(|p| p.exists())
+                .map(|p| to_wide_null(&p.to_string_lossy()));
+
+            let mut bi = BROWSEINFOW {
+                hwndOwner: hwnd,
+                pidlRoot: std::ptr::null(),
+                pszDisplayName: display_buf.as_mut_ptr(),
+                lpszTitle: title.as_ptr(),
+                ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX,
+                lpfn: if init_wide.is_some() {
+                    Some(browse_callback)
+                } else {
+                    None
+                },
+                lParam: init_wide
+                    .as_ref()
+                    .map(|v| v.as_ptr() as isize)
+                    .unwrap_or(0),
+                iImage: 0,
+            };
+
+            let pidl = SHBrowseForFolderW(&mut bi);
+            if pidl.is_null() {
+                CoUninitialize();
+                return None;
+            }
+
+            let mut path_buf = vec![0u16; 1024];
+            let ok = SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr());
+            CoTaskMemFree(pidl);
+            CoUninitialize();
+
+            if ok != 0 {
+                let s = from_wide_buf(&path_buf);
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            None
+        }
+    }
+
+    pub fn show_file_dialog(
+        owner_hwnd: isize,
+        is_save: bool,
+        overwrite_prompt: bool,
+        filter_spec: &[(&str, &str)],
+        default_ext: Option<&str>,
+        initial_path: Option<&Path>,
+    ) -> Result<Option<String>, String> {
+        unsafe {
+            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
+            let hwnd = if owner_hwnd != 0 {
+                owner_hwnd
+            } else {
+                GetForegroundWindow()
+            };
+
+            let mut filter_wide: Vec<u16> = Vec::new();
+            for (label, pattern) in filter_spec {
+                filter_wide.extend(OsStr::new(label).encode_wide());
+                filter_wide.push(0);
+                filter_wide.extend(OsStr::new(pattern).encode_wide());
+                filter_wide.push(0);
+            }
+            filter_wide.push(0);
+
+            let mut file_buf = vec![0u16; 1024];
+            let mut init_dir_wide: Option<Vec<u16>> = None;
+
+            if let Some(p) = initial_path {
+                if p.is_dir() && p.exists() {
+                    init_dir_wide = Some(to_wide_null(&p.to_string_lossy()));
+                } else {
+                    if let Some(parent) = p.parent() {
+                        if parent.exists() {
+                            init_dir_wide = Some(to_wide_null(&parent.to_string_lossy()));
+                        }
+                    }
+                    if is_save {
+                        if let Some(fname) = p.file_name() {
+                            let wide_name: Vec<u16> = fname.encode_wide().collect();
+                            if wide_name.len() + 1 < file_buf.len() {
+                                file_buf[..wide_name.len()].copy_from_slice(&wide_name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let def_ext_wide = default_ext.map(to_wide_null);
+
+            let mut flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+            if is_save {
+                if overwrite_prompt {
+                    flags |= OFN_OVERWRITEPROMPT;
+                }
+            } else {
+                flags |= OFN_FILEMUSTEXIST;
+            }
+
+            let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+            ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = filter_wide.as_ptr();
+            ofn.nFilterIndex = 1;
+            ofn.lpstrFile = file_buf.as_mut_ptr();
+            ofn.nMaxFile = file_buf.len() as u32;
+            ofn.lpstrInitialDir = init_dir_wide
+                .as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(std::ptr::null());
+            ofn.Flags = flags;
+            ofn.lpstrDefExt = def_ext_wide
+                .as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(std::ptr::null());
+
+            let mut res = if is_save {
+                GetSaveFileNameW(&mut ofn)
+            } else {
+                GetOpenFileNameW(&mut ofn)
+            };
+
+            if res == 0 {
+                let err_code = CommDlgExtendedError();
+                if err_code != 0 {
+                    // Fallback: retry with hwndOwner = 0 and clean file_buf
+                    file_buf.fill(0);
+                    ofn.hwndOwner = 0;
+                    ofn.lpstrInitialDir = std::ptr::null();
+                    res = if is_save {
+                        GetSaveFileNameW(&mut ofn)
+                    } else {
+                        GetOpenFileNameW(&mut ofn)
+                    };
+                    if res == 0 {
+                        let err_code2 = CommDlgExtendedError();
+                        if err_code2 != 0 {
+                            CoUninitialize();
+                            return Err(format!("Common dialog error code: 0x{:X}", err_code2));
+                        }
+                    }
+                }
+            }
+
+            CoUninitialize();
+
+            if res != 0 {
+                let s = from_wide_buf(&file_buf);
+                if !s.is_empty() {
+                    return Ok(Some(s));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    pub fn resolve_initial_path(current_path: Option<&str>) -> Option<PathBuf> {
+        let s = current_path?.trim();
+        if s.is_empty() {
+            return std::env::current_dir().ok();
+        }
+        if let Some(resolved) = super::resolve_project_path(s) {
+            return Some(resolved);
+        }
+        let pb = PathBuf::from(s);
+        if pb.is_absolute() {
+            return Some(pb);
+        }
+        std::env::current_dir().ok().map(|cwd| cwd.join(pb))
+    }
+}
+
 #[tauri::command]
-pub async fn pick_path(mode: String) -> Result<Option<String>, String> {
+pub async fn pick_path(
+    window: tauri::WebviewWindow,
+    mode: String,
+    current_path: Option<String>,
+) -> Result<Option<String>, String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let script = match mode.as_str() {
-            "folder" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
-            }
-            "file_ico" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Icon Files (*.ico)|*.ico|All Files (*.*)|*.*'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            "file_exe" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Executable Files (*.exe)|*.exe|All Files (*.*)|*.*'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            "file_any" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'All Files (*.*)|*.*'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            "save_thor" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'THOR Patch Archive (*.thor)|*.thor'; $d.DefaultExt = 'thor'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            "save_exe" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'Standalone Patcher (*.exe)|*.exe'; $d.DefaultExt = 'exe'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            "file_plist" => {
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'Patch List (plist.txt)|*.txt|All Files (*.*)|*.*'; $d.OverwritePrompt = $false; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }"
-            }
-            _ => return Err("Unsupported picker mode".to_string()),
-        };
+        let owner_hwnd = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let handle = std::thread::spawn(move || -> Result<Option<String>, String> {
+            let init_path = win32_dialog::resolve_initial_path(current_path.as_deref());
+            let init_ref = init_path.as_deref();
+            let picked = match mode.as_str() {
+                "folder" => Ok(win32_dialog::show_folder_dialog(owner_hwnd, init_ref)),
+                "file_ico" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    false,
+                    false,
+                    &[("Icon Files (*.ico)", "*.ico"), ("All Files (*.*)", "*.*")],
+                    Some("ico"),
+                    init_ref,
+                ),
+                "file_exe" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    false,
+                    false,
+                    &[
+                        ("Executable Files (*.exe)", "*.exe"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    Some("exe"),
+                    init_ref,
+                ),
+                "file_any" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    false,
+                    false,
+                    &[("All Files (*.*)", "*.*")],
+                    None,
+                    init_ref,
+                ),
+                "save_thor" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    true,
+                    true,
+                    &[
+                        ("THOR Patch Archive (*.thor)", "*.thor"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    Some("thor"),
+                    init_ref,
+                ),
+                "save_exe" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    true,
+                    true,
+                    &[
+                        ("Standalone Patcher (*.exe)", "*.exe"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    Some("exe"),
+                    init_ref,
+                ),
+                "file_plist" => win32_dialog::show_file_dialog(
+                    owner_hwnd,
+                    true,
+                    false,
+                    &[
+                        ("Patch List (plist.txt)", "*.txt"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    Some("txt"),
+                    init_ref,
+                ),
+                _ => return Err(format!("Unsupported picker mode: {}", mode)),
+            }?;
+            Ok(picked)
+        });
 
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", script])
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| format!("Failed to open file dialog: {:#}", e))?;
-
-        let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if selected.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(selected))
-        }
+        handle
+            .join()
+            .map_err(|_| "File dialog thread panicked".to_string())?
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = mode;
+        let _ = (window, mode, current_path);
         Ok(None)
     }
 }
 
 #[tauri::command]
-pub async fn import_delete_list_file() -> Result<Vec<String>, String> {
+pub async fn import_delete_list_file(window: tauri::WebviewWindow) -> Result<Vec<String>, String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let script = "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Text List (*.txt)|*.txt|All Files (*.*)|*.*'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.FileName }";
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", script])
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| format!("Failed to open file dialog: {:#}", e))?;
+        let owner_hwnd = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let selected_opt = std::thread::spawn(move || {
+            let init_path = std::env::current_dir().ok();
+            win32_dialog::show_file_dialog(
+                owner_hwnd,
+                false,
+                false,
+                &[("Text List (*.txt)", "*.txt"), ("All Files (*.*)", "*.*")],
+                Some("txt"),
+                init_path.as_deref(),
+            )
+        })
+        .join()
+        .map_err(|_| "File dialog thread panicked".to_string())??;
 
-        let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if selected.is_empty() {
+        let Some(selected) = selected_opt else {
             return Ok(Vec::new());
-        }
+        };
         let content = fs::read_to_string(&selected)
             .map_err(|e| format!("Failed to read delete list file: {:#}", e))?;
         Ok(parse_delete_list(&content))
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = window;
         Ok(Vec::new())
     }
 }

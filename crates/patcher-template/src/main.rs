@@ -346,8 +346,8 @@ fn main() -> anyhow::Result<()> {
     let assets_for_protocol = assets_arc.clone();
     let protocol_handler = move |_id: wry::WebViewId, req: wry::http::Request<Vec<u8>>| {
         let uri_path = req.uri().path();
-        let normalized = uri_path
-            .trim_start_matches('/')
+        let raw_trimmed = uri_path.trim_start_matches('/');
+        let normalized = raw_trimmed
             .trim_start_matches("assets/")
             .trim_start_matches("app/");
 
@@ -357,7 +357,15 @@ fn main() -> anyhow::Result<()> {
             normalized
         };
 
-        if let Some((bytes, mime)) = assets_for_protocol.get(lookup_key) {
+        let found_asset = if !raw_trimmed.is_empty() {
+            assets_for_protocol
+                .get(raw_trimmed)
+                .or_else(|| assets_for_protocol.get(lookup_key))
+        } else {
+            assets_for_protocol.get(lookup_key)
+        };
+
+        if let Some((bytes, mime)) = found_asset {
             Response::builder()
                 .header("Content-Type", mime.as_str())
                 .body(Cow::Owned(bytes.clone()))
