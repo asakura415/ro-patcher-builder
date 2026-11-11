@@ -68,9 +68,13 @@ impl PatcherEngine {
     {
         self.cancel_signal.store(false, Ordering::SeqCst);
 
-        // Step 1: Acquire lock
-        let _lock = FileLock::try_acquire(&self.lock_path)
-            .with_context(|| "Failed to acquire patcher lock")?;
+        // Step 1: Acquire lock (with brief retry for self-update / Admin relaunch handoff)
+        let _lock = FileLock::try_acquire_with_retry(
+            &self.lock_path,
+            10,
+            std::time::Duration::from_millis(150),
+        )
+        .with_context(|| "Failed to acquire patcher lock")?;
 
         status_cb(EngineStatus::CheckingForUpdates);
 
@@ -80,6 +84,7 @@ impl PatcherEngine {
 
         // Step 3: Find available server & fetch patch list
         let http_client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ModernROPatcher/1.0")
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
 
@@ -178,6 +183,14 @@ impl PatcherEngine {
 
     pub fn restart_self(&self) -> Result<()> {
         launcher::restart_current_exe(&self.game_dir)
+    }
+
+    pub fn relaunch_as_admin(&self) -> Result<bool> {
+        launcher::relaunch_as_admin(&self.game_dir)
+    }
+
+    pub fn is_running_as_admin(&self) -> bool {
+        launcher::is_running_as_admin()
     }
 
     pub fn reset_cache(&self) -> Result<()> {

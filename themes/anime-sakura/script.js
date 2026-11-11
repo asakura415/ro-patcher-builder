@@ -12,6 +12,34 @@ document.addEventListener("DOMContentLoaded", function () {
     const serverTitle = document.getElementById("serverTitle");
     const noticeLinkItem = document.getElementById("noticeLinkItem");
     const btnSoundToggle = document.getElementById("btnSoundToggle");
+    const btnAdminMode = document.getElementById("btnAdminMode");
+    const adminModeText = document.getElementById("adminModeText");
+
+    function updateAdminBadge(isAdmin) {
+        if (!btnAdminMode || !adminModeText) return;
+        if (isAdmin) {
+            btnAdminMode.classList.remove("user-mode");
+            btnAdminMode.classList.add("admin-mode");
+            btnAdminMode.setAttribute("aria-disabled", "true");
+            btnAdminMode.title = "กำลังทำงานด้วยสิทธิ์ผู้ดูแลระบบ (Running as Administrator)";
+            adminModeText.innerText = "Admin Mode (สิทธิ์เต็ม)";
+        } else {
+            btnAdminMode.classList.remove("admin-mode");
+            btnAdminMode.classList.add("user-mode");
+            btnAdminMode.removeAttribute("aria-disabled");
+            btnAdminMode.title = "คลิกเพื่อขอสิทธิ์ผู้ดูแลระบบ (Run as Administrator)";
+            adminModeText.innerText = "User Mode (คลิกเพื่อขอ Admin)";
+        }
+    }
+
+    if (btnAdminMode) {
+        btnAdminMode.addEventListener("click", () => {
+            const isAdmin = window.PatcherAPI && window.PatcherAPI.config && window.PatcherAPI.config.is_admin;
+            if (!isAdmin && window.PatcherAPI && window.PatcherAPI.requestAdmin) {
+                window.PatcherAPI.requestAdmin();
+            }
+        });
+    }
 
     // ------------------------------------------
     // 1. Web Audio UI Synthesizer (Anime SFX)
@@ -189,6 +217,7 @@ document.addEventListener("DOMContentLoaded", function () {
             if (window.PatcherAPI.config.notice_url && noticeLinkItem) {
                 noticeLinkItem.setAttribute("href", window.PatcherAPI.config.notice_url);
             }
+            updateAdminBadge(Boolean(window.PatcherAPI.config.is_admin));
         }
 
         window.PatcherAPI.onStatusChange = function (status, data) {

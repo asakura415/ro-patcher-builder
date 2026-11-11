@@ -39,8 +39,11 @@ pub fn read_cache_file(path: impl AsRef<Path>) -> Result<PatcherCache> {
 pub fn write_cache_file(path: impl AsRef<Path>, cache: &PatcherCache) -> Result<()> {
     let path = path.as_ref();
     let content = serde_json::to_string_pretty(cache)?;
-    std::fs::write(path, content)
-        .with_context(|| format!("Failed to write cache file at {:?}", path))?;
+    if std::fs::write(path, &content).is_err() {
+        crate::patching::clear_readonly_if_needed(path);
+        std::fs::write(path, content)
+            .with_context(|| format!("Failed to write cache file at {:?}", path))?;
+    }
     Ok(())
 }
 

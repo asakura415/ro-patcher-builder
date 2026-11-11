@@ -7,6 +7,34 @@ document.addEventListener("DOMContentLoaded", function() {
     const detailSpeed = document.getElementById("detailSpeed");
     const btnPlay = document.getElementById("btnPlay");
     const serverTitle = document.getElementById("serverTitle");
+    const btnAdminMode = document.getElementById("btnAdminMode");
+    const adminModeText = document.getElementById("adminModeText");
+
+    function updateAdminBadge(isAdmin) {
+        if (!btnAdminMode || !adminModeText) return;
+        if (isAdmin) {
+            btnAdminMode.classList.remove("user-mode");
+            btnAdminMode.classList.add("admin-mode");
+            btnAdminMode.setAttribute("aria-disabled", "true");
+            btnAdminMode.title = "กำลังทำงานด้วยสิทธิ์ผู้ดูแลระบบ (Running as Administrator)";
+            adminModeText.innerText = "Admin Mode (สิทธิ์เต็ม)";
+        } else {
+            btnAdminMode.classList.remove("admin-mode");
+            btnAdminMode.classList.add("user-mode");
+            btnAdminMode.removeAttribute("aria-disabled");
+            btnAdminMode.title = "คลิกเพื่อขอสิทธิ์ผู้ดูแลระบบ (Run as Administrator)";
+            adminModeText.innerText = "User Mode (คลิกเพื่อขอ Admin)";
+        }
+    }
+
+    if (btnAdminMode) {
+        btnAdminMode.addEventListener("click", () => {
+            const isAdmin = window.PatcherAPI && window.PatcherAPI.config && window.PatcherAPI.config.is_admin;
+            if (!isAdmin && window.PatcherAPI && window.PatcherAPI.requestAdmin) {
+                window.PatcherAPI.requestAdmin();
+            }
+        });
+    }
 
     if (window.PatcherAPI) {
         if (window.PatcherAPI.config) {
@@ -20,6 +48,7 @@ document.addEventListener("DOMContentLoaded", function() {
                     noticeItems[1].setAttribute("target", "_blank");
                 }
             }
+            updateAdminBadge(Boolean(window.PatcherAPI.config.is_admin));
         }
 
         window.PatcherAPI.onStatusChange = function(status, data) {

@@ -117,6 +117,17 @@ pub fn apply_single_patch(
     }
 }
 
+/// Clears the Read-Only attribute on a file if it is currently set.
+pub fn clear_readonly_if_needed(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
 pub fn apply_patch_to_grf<R: Read + Seek>(
     method: GrfPatchingMethod,
     create_if_needed: bool,
@@ -134,16 +145,24 @@ pub fn apply_patch_to_grf<R: Read + Seek>(
 
     if grf_path.exists() {
         // Verify that the GRF file is writable and not locked by a running game client
-        fs::OpenOptions::new()
+        let open_res = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(grf_path)
-            .with_context(|| {
-                format!(
-                    "Target GRF {:?} is locked or in use by another process (please close the game client first)",
-                    grf_path.file_name().unwrap_or_default()
-                )
-            })?;
+            .or_else(|_| {
+                clear_readonly_if_needed(grf_path);
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(grf_path)
+            });
+
+        open_res.with_context(|| {
+            format!(
+                "Target GRF {:?} is locked, read-only, or requires Administrator privileges (please close the game client or switch to Admin Mode)",
+                grf_path.file_name().unwrap_or_default()
+            )
+        })?;
     }
 
     match method {
@@ -273,10 +292,21 @@ pub fn apply_patch_to_disk<R: Read + Seek>(
     let mut self_updated = false;
 
     for entry in entries {
+        let is_dir_entry = entry.relative_path.ends_with('\\') || entry.relative_path.ends_with('/');
         let dest_path = join_windows_relative_path(game_dir, &entry.relative_path);
 
+        if is_dir_entry || dest_path.is_dir() {
+            if !entry.is_removed {
+                let _ = fs::create_dir_all(&dest_path);
+            }
+            continue;
+        }
+
         if entry.is_removed {
-            let _ = fs::remove_file(&dest_path);
+            if fs::remove_file(&dest_path).is_err() {
+                clear_readonly_if_needed(&dest_path);
+                let _ = fs::remove_file(&dest_path);
+            }
             continue;
         }
 
@@ -294,12 +324,18 @@ pub fn apply_patch_to_disk<R: Read + Seek>(
             // Windows allows renaming a running executable!
             let mut backup_exe = dest_path.clone();
             backup_exe.set_extension("exe.old");
+            clear_readonly_if_needed(&backup_exe);
             let _ = fs::remove_file(&backup_exe); // Remove any old backup
+            clear_readonly_if_needed(&dest_path);
             let _ = fs::rename(&dest_path, &backup_exe);
             self_updated = true;
         }
 
-        thor.extract_file(&entry.relative_path, &dest_path)?;
+        if thor.extract_file(&entry.relative_path, &dest_path).is_err() {
+            clear_readonly_if_needed(&dest_path);
+            thor.extract_file(&entry.relative_path, &dest_path)
+                .with_context(|| format!("Failed to write file {:?}", dest_path))?;
+        }
     }
 
     Ok(self_updated)

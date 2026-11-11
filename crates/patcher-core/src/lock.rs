@@ -18,6 +18,15 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .open(lock_path)
+            .or_else(|_| {
+                crate::patching::clear_readonly_if_needed(lock_path);
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(lock_path)
+            })
             .with_context(|| format!("Failed to open lock file at {:?}", lock_path))?;
 
         match file.try_lock_exclusive() {
@@ -28,6 +37,28 @@ impl FileLock {
                 );
             }
         }
+    }
+
+    /// Attempts to acquire an exclusive lock, retrying briefly in case a previous instance
+    /// (such as during self-update restart or UAC Admin elevation) is still exiting.
+    pub fn try_acquire_with_retry(
+        lock_path: impl AsRef<Path>,
+        retries: usize,
+        delay: std::time::Duration,
+    ) -> Result<Self> {
+        let path = lock_path.as_ref();
+        for attempt in 0..=retries {
+            match Self::try_acquire(path) {
+                Ok(lock) => return Ok(lock),
+                Err(e) => {
+                    if attempt == retries {
+                        return Err(e);
+                    }
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+        unreachable!()
     }
 }
 

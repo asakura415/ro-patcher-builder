@@ -37,6 +37,8 @@ pub async fn find_available_patch_server(
         bail!("No patch servers configured.");
     }
 
+    let mut errors = Vec::new();
+
     // Try preferred server first if specified
     if let Some(pref_name) = preferred {
         if let Some(srv) = servers.iter().find(|s| s.name == pref_name) {
@@ -47,6 +49,7 @@ pub async fn find_available_patch_server(
                 }
                 Err(err) => {
                     log::warn!("Preferred server '{}' unavailable: {:#}", srv.name, err);
+                    errors.push(format!("{}: {:#}", srv.name, err));
                 }
             }
         }
@@ -64,20 +67,30 @@ pub async fn find_available_patch_server(
             }
             Err(err) => {
                 log::warn!("Server '{}' unavailable: {:#}", srv.name, err);
+                errors.push(format!("{}: {:#}", srv.name, err));
             }
         }
     }
 
-    bail!("All patch servers are unreachable.");
+    if errors.is_empty() {
+        bail!("All patch servers are unreachable.");
+    } else {
+        bail!("All patch servers are unreachable ({})", errors.join("; "));
+    }
 }
 
 async fn probe_server(
     client: &reqwest::Client,
     server: &PatchServerInfo,
 ) -> Result<(Vec<PatchItem>, Url)> {
-    let plist_url = Url::parse(&server.plist_url)
+    let plist_url = Url::parse(server.plist_url.trim())
         .with_context(|| format!("Invalid plist_url: {}", server.plist_url))?;
-    let patch_url = Url::parse(&server.patch_url)
+    let normalized_patch_url = if server.patch_url.trim().ends_with('/') {
+        server.patch_url.trim().to_string()
+    } else {
+        format!("{}/", server.patch_url.trim())
+    };
+    let patch_url = Url::parse(&normalized_patch_url)
         .with_context(|| format!("Invalid patch_url: {}", server.patch_url))?;
 
     let resp = client
@@ -98,13 +111,15 @@ async fn probe_server(
     if let Some(first_patch) = patch_list.first() {
         let first_patch_url = patch_url.join(&first_patch.file_name)?;
         let head_resp = client
-            .head(first_patch_url)
+            .head(first_patch_url.clone())
             .timeout(Duration::from_secs(5))
             .send()
             .await;
         if let Ok(head) = head_resp {
-            if !head.status().is_success() {
-                bail!("Patch files not found on {}", patch_url);
+            let status = head.status();
+            // Only fail if server explicitly returns 404 Not Found or 5xx; some servers block HEAD with 405/403
+            if status == reqwest::StatusCode::NOT_FOUND || status.is_server_error() {
+                bail!("Patch file '{}' not found on {} (HTTP {})", first_patch.file_name, patch_url, status);
             }
         }
     }

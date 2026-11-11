@@ -109,3 +109,83 @@ pub fn restart_current_exe(working_dir: impl AsRef<Path>) -> Result<()> {
 
     Ok(())
 }
+
+/// Checks whether the current process is running with elevated Administrator privileges.
+pub fn is_running_as_admin() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Requests UAC elevation ("runas") to relaunch the current executable as Administrator.
+/// Returns `Ok(true)` if the elevated process was started, or `Ok(false)` if the user cancelled UAC.
+pub fn relaunch_as_admin(working_dir: impl AsRef<Path>) -> Result<bool> {
+    let current_exe = std::env::current_exe()
+        .with_context(|| "Failed to resolve current executable path for elevation")?;
+    let dir = working_dir.as_ref();
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+
+        const SW_SHOWNORMAL: i32 = 1;
+
+        let verb: Vec<u16> = std::ffi::OsStr::new("runas")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let file: Vec<u16> = current_exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let work_dir: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let result = unsafe {
+            ShellExecuteW(
+                0,
+                verb.as_ptr(),
+                file.as_ptr(),
+                ptr::null(),
+                work_dir.as_ptr(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        // ShellExecuteW returns a value > 32 on success.
+        // <= 32 indicates an error or user cancellation (e.g., SE_ERR_ACCESSDENIED = 5).
+        Ok(result > 32)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (current_exe, dir);
+        Ok(false)
+    }
+}

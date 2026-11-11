@@ -14,7 +14,7 @@ use tao::window::WindowBuilder;
 use wry::{http::Response, WebContext, WebView, WebViewBuilder};
 
 use patcher_core::config::PatcherConfig;
-use patcher_core::launcher::cleanup_self_update_backup;
+use patcher_core::launcher::{cleanup_self_update_backup, is_running_as_admin};
 use patcher_core::overlay::{parse_embedded_assets, read_overlay_from_current_exe};
 use patcher_core::{EngineStatus, PatcherEngine};
 
@@ -26,6 +26,7 @@ enum IpcAction {
     StartUpdate,
     ForceRepatch,
     Restart,
+    RequestAdmin,
     Close,
     Minimize,
     DragWindow,
@@ -60,6 +61,9 @@ const JS_BRIDGE_SCRIPT: &str = r#"
         },
         restart: function() {
             window.ipc.postMessage(JSON.stringify({ action: "restart" }));
+        },
+        requestAdmin: function() {
+            window.ipc.postMessage(JSON.stringify({ action: "request_admin" }));
         },
         close: function() {
             window.ipc.postMessage(JSON.stringify({ action: "close" }));
@@ -140,7 +144,38 @@ const DEFAULT_FALLBACK_HTML: &str = r##"<!DOCTYPE html>
             -webkit-app-region: drag;
         }
         .title { font-size: 13px; font-weight: 600; color: #a0aec0; }
-        .window-controls { display: flex; gap: 8px; }
+        .window-controls { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
+        .admin-mode-btn {
+            height: 26px;
+            padding: 0 10px;
+            border-radius: 6px;
+            font-size: 11.5px;
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+        .admin-mode-btn.user-mode {
+            background: rgba(180, 105, 14, 0.32);
+            border: 1px solid rgba(245, 158, 11, 0.78);
+            color: #fbbf24;
+            cursor: pointer;
+        }
+        .admin-mode-btn.user-mode:hover {
+            background: rgba(217, 119, 6, 0.45);
+            border-color: #fbbf24;
+        }
+        .admin-mode-btn.admin-mode {
+            background: rgba(16, 120, 88, 0.35);
+            border: 1px solid rgba(16, 185, 129, 0.78);
+            color: #34d399;
+            cursor: default;
+        }
+        .admin-mode-btn:focus-visible, .control-btn:focus-visible, .btn:focus-visible {
+            outline: 2px solid currentColor;
+            outline-offset: 2px;
+        }
         .control-btn {
             background: none;
             border: none;
@@ -211,9 +246,16 @@ const DEFAULT_FALLBACK_HTML: &str = r##"<!DOCTYPE html>
 <body>
     <div class="titlebar" data-patcher-drag>
         <div class="title" id="titleText">Modern RO Patcher</div>
-        <div class="window-controls">
-            <button class="control-btn" onclick="window.PatcherAPI.minimize()">&#8211;</button>
-            <button class="control-btn close" onclick="window.PatcherAPI.close()">&#10005;</button>
+        <div class="window-controls no-drag">
+            <button type="button" class="admin-mode-btn user-mode no-drag" id="btnAdminMode" onclick="if (!(window.PatcherAPI && window.PatcherAPI.config && window.PatcherAPI.config.is_admin)) { window.PatcherAPI.requestAdmin(); }">
+                <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 2L4 5v6.09c0 5.05 3.41 9.76 8 10.91 4.59-1.15 8-5.86 8-10.91V5l-8-3z" fill="rgba(255,255,255,0.2)" stroke="#000" stroke-width="1.8" stroke-linejoin="round"/>
+                    <path d="M12 2L4 5v6.09c0 5.05 3.41 9.76 8 10.91V2z" fill="#000"/>
+                </svg>
+                <span id="adminModeText">User Mode (คลิกเพื่อขอ Admin)</span>
+            </button>
+            <button type="button" class="control-btn" onclick="window.PatcherAPI.minimize()">&#8211;</button>
+            <button type="button" class="control-btn close" onclick="window.PatcherAPI.close()">&#10005;</button>
         </div>
     </div>
     <div class="content">
@@ -240,6 +282,16 @@ const DEFAULT_FALLBACK_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const btnAdmin = document.getElementById("btnAdminMode");
+            const txtAdmin = document.getElementById("adminModeText");
+            if (window.PatcherAPI && window.PatcherAPI.config && window.PatcherAPI.config.is_admin && btnAdmin && txtAdmin) {
+                btnAdmin.classList.remove("user-mode");
+                btnAdmin.classList.add("admin-mode");
+                btnAdmin.setAttribute("aria-disabled", "true");
+                txtAdmin.innerText = "Admin Mode (สิทธิ์เต็ม)";
+            }
+        });
         window.PatcherAPI.onStatusChange = function(status, progress) {
             const statusMsg = document.getElementById("statusMessage");
             const fill = document.getElementById("progressFill");
@@ -397,9 +449,11 @@ fn main() -> anyhow::Result<()> {
         .join("WebView2");
     let mut web_context = WebContext::new(Some(webview_data_dir));
 
+    let is_admin = is_running_as_admin();
     let client_cfg_json = serde_json::json!({
         "title": config.window.title,
         "notice_url": config.server.notice_url,
+        "is_admin": is_admin,
     });
     let init_script = format!(
         "{}\nwindow.PatcherAPI.config = {};",
@@ -426,6 +480,24 @@ fn main() -> anyhow::Result<()> {
                 IpcAction::Restart => {
                     let _ = engine_for_ipc.restart_self();
                     let _ = proxy_for_ipc.send_event(UserEvent::CloseWindow);
+                }
+                IpcAction::RequestAdmin => {
+                    if !engine_for_ipc.is_running_as_admin() {
+                        engine_for_ipc.cancel();
+                        match engine_for_ipc.relaunch_as_admin() {
+                            Ok(true) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::CloseWindow);
+                            }
+                            Ok(false) => {
+                                log::info!("User cancelled UAC elevation prompt.");
+                            }
+                            Err(e) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::StatusUpdate(
+                                    EngineStatus::Error(format!("Failed to request Admin mode: {:#}", e)),
+                                ));
+                            }
+                        }
+                    }
                 }
                 IpcAction::Minimize => {
                     let _ = proxy_for_ipc.send_event(UserEvent::MinimizeWindow);
