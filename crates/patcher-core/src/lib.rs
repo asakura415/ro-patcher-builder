@@ -193,6 +193,10 @@ impl PatcherEngine {
         launcher::is_running_as_admin()
     }
 
+    pub fn open_url(&self, url: &str) -> Result<()> {
+        launcher::open_external_url(url)
+    }
+
     pub fn reset_cache(&self) -> Result<()> {
         cache::write_cache_file(
             &self.cache_path,

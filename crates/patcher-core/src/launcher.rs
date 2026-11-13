@@ -126,6 +126,114 @@ pub fn is_running_as_admin() -> bool {
     }
 }
 
+#[cfg(windows)]
+fn to_wide_null(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn shell_execute_w(
+    verb: &str,
+    file: &std::ffi::OsStr,
+    working_dir: Option<&std::ffi::OsStr>,
+) -> isize {
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+
+    let verb_w = to_wide_null(std::ffi::OsStr::new(verb));
+    let file_w = to_wide_null(file);
+    let dir_w = working_dir.map(to_wide_null);
+    let dir_ptr = dir_w.as_ref().map_or(ptr::null(), |d| d.as_ptr());
+
+    unsafe {
+        ShellExecuteW(
+            0,
+            verb_w.as_ptr(),
+            file_w.as_ptr(),
+            ptr::null(),
+            dir_ptr,
+            SW_SHOWNORMAL,
+        )
+    }
+}
+
+/// Validates that a URL is a well-formed HTTP or HTTPS link safe to pass to the OS shell.
+pub fn validate_external_url(url: &str) -> Result<&str> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        bail!("External URL cannot be empty");
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        bail!("External URL contains invalid control characters");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let after_scheme = if let Some(rest) = lower.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("http://") {
+        rest
+    } else {
+        bail!("Only http:// and https:// URLs are allowed: {:?}", trimmed);
+    };
+
+    if after_scheme.is_empty() || after_scheme.starts_with('/') {
+        bail!("External URL is missing a valid host: {:?}", trimmed);
+    }
+
+    Ok(trimmed)
+}
+
+/// Opens an external HTTP(S) URL in the user's default web browser.
+pub fn open_external_url(url: &str) -> Result<()> {
+    let valid_url = validate_external_url(url)?;
+    log::info!("Opening external URL in default browser: {}", valid_url);
+
+    #[cfg(windows)]
+    {
+        let result = shell_execute_w("open", std::ffi::OsStr::new(valid_url), None);
+        // ShellExecuteW returns a value > 32 on success.
+        if result <= 32 {
+            bail!(
+                "ShellExecuteW failed to open URL {:?} (error code {})",
+                valid_url,
+                result
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(valid_url)
+            .spawn()
+            .with_context(|| format!("Failed to launch browser for {:?}", valid_url))?;
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(valid_url)
+            .spawn()
+            .with_context(|| format!("Failed to launch browser for {:?}", valid_url))?;
+    }
+
+    Ok(())
+}
+
 /// Requests UAC elevation ("runas") to relaunch the current executable as Administrator.
 /// Returns `Ok(true)` if the elevated process was started, or `Ok(false)` if the user cancelled UAC.
 pub fn relaunch_as_admin(working_dir: impl AsRef<Path>) -> Result<bool> {
@@ -135,48 +243,11 @@ pub fn relaunch_as_admin(working_dir: impl AsRef<Path>) -> Result<bool> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        #[link(name = "shell32")]
-        extern "system" {
-            fn ShellExecuteW(
-                hwnd: isize,
-                lp_operation: *const u16,
-                lp_file: *const u16,
-                lp_parameters: *const u16,
-                lp_directory: *const u16,
-                n_show_cmd: i32,
-            ) -> isize;
-        }
-
-        const SW_SHOWNORMAL: i32 = 1;
-
-        let verb: Vec<u16> = std::ffi::OsStr::new("runas")
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let file: Vec<u16> = current_exe
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let work_dir: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let result = unsafe {
-            ShellExecuteW(
-                0,
-                verb.as_ptr(),
-                file.as_ptr(),
-                ptr::null(),
-                work_dir.as_ptr(),
-                SW_SHOWNORMAL,
-            )
-        };
+        let result = shell_execute_w(
+            "runas",
+            current_exe.as_os_str(),
+            Some(dir.as_os_str()),
+        );
 
         // ShellExecuteW returns a value > 32 on success.
         // <= 32 indicates an error or user cancellation (e.g., SE_ERR_ACCESSDENIED = 5).
@@ -187,5 +258,53 @@ pub fn relaunch_as_admin(working_dir: impl AsRef<Path>) -> Result<bool> {
     {
         let _ = (current_exe, dir);
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_external_url_accepts_http_and_https() {
+        assert_eq!(
+            validate_external_url("https://discord.gg").unwrap(),
+            "https://discord.gg"
+        );
+        assert_eq!(
+            validate_external_url("  http://example.com/news?id=1  ").unwrap(),
+            "http://example.com/news?id=1"
+        );
+        assert_eq!(
+            validate_external_url("HTTPS://pronterabox.com/events").unwrap(),
+            "HTTPS://pronterabox.com/events"
+        );
+    }
+
+    #[test]
+    fn test_validate_external_url_rejects_unsafe_or_malformed() {
+        for bad in [
+            "",
+            "   ",
+            "#",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "cmd://whoami",
+            "ms-msdt:id",
+            "https://",
+            "http:///path",
+            "https://example.com\nfoo",
+        ] {
+            assert!(
+                validate_external_url(bad).is_err(),
+                "Expected {:?} to be rejected",
+                bad
+            );
+            assert!(
+                open_external_url(bad).is_err(),
+                "Expected open_external_url({:?}) to return Err",
+                bad
+            );
+        }
     }
 }

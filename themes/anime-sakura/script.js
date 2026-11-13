@@ -214,8 +214,18 @@ document.addEventListener("DOMContentLoaded", function () {
             if (window.PatcherAPI.config.title && serverTitle) {
                 serverTitle.innerText = window.PatcherAPI.config.title.replace(/\s*-\s*Patcher$/i, "");
             }
-            if (window.PatcherAPI.config.notice_url && noticeLinkItem) {
-                noticeLinkItem.setAttribute("href", window.PatcherAPI.config.notice_url);
+            const rawNoticeUrl = typeof window.PatcherAPI.config.notice_url === "string"
+                ? window.PatcherAPI.config.notice_url.trim()
+                : "";
+            if (rawNoticeUrl && noticeLinkItem) {
+                const normalizedNoticeUrl = /^[a-z][a-z0-9+.-]*:/i.test(rawNoticeUrl)
+                    ? rawNoticeUrl
+                    : `https://${rawNoticeUrl}`;
+                if (/^https?:\/\//i.test(normalizedNoticeUrl)) {
+                    noticeLinkItem.setAttribute("href", normalizedNoticeUrl);
+                    noticeLinkItem.setAttribute("target", "_blank");
+                    noticeLinkItem.setAttribute("rel", "noopener noreferrer");
+                }
             }
             updateAdminBadge(Boolean(window.PatcherAPI.config.is_admin));
         }

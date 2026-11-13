@@ -11,10 +11,10 @@ use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
-use wry::{http::Response, WebContext, WebView, WebViewBuilder};
+use wry::{http::Response, NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
 use patcher_core::config::PatcherConfig;
-use patcher_core::launcher::{cleanup_self_update_backup, is_running_as_admin};
+use patcher_core::launcher::{cleanup_self_update_backup, is_running_as_admin, open_external_url};
 use patcher_core::overlay::{parse_embedded_assets, read_overlay_from_current_exe};
 use patcher_core::{EngineStatus, PatcherEngine};
 
@@ -27,6 +27,7 @@ enum IpcAction {
     ForceRepatch,
     Restart,
     RequestAdmin,
+    OpenUrl { url: String },
     Close,
     Minimize,
     DragWindow,
@@ -40,7 +41,7 @@ enum UserEvent {
     DragWindow,
 }
 
-const JS_BRIDGE_SCRIPT: &str = r#"
+const JS_BRIDGE_SCRIPT: &str = r##"
 (function() {
     var _callback = null;
     var _lastStatus = null;
@@ -64,6 +65,11 @@ const JS_BRIDGE_SCRIPT: &str = r#"
         },
         requestAdmin: function() {
             window.ipc.postMessage(JSON.stringify({ action: "request_admin" }));
+        },
+        openUrl: function(url) {
+            if (typeof url === "string" && /^https?:\/\//i.test(url.trim())) {
+                window.ipc.postMessage(JSON.stringify({ action: "open_url", url: url.trim() }));
+            }
         },
         close: function() {
             window.ipc.postMessage(JSON.stringify({ action: "close" }));
@@ -92,6 +98,25 @@ const JS_BRIDGE_SCRIPT: &str = r#"
         }
     };
 
+    // Intercept clicks on external HTTP(S) links so they open in the system's default browser
+    document.addEventListener("click", function(e) {
+        var targetEl = e.target instanceof Element ? e.target : (e.target && e.target.parentElement);
+        var anchor = targetEl && targetEl.closest ? targetEl.closest("a[href]") : null;
+        if (!anchor) return;
+
+        var rawHref = (anchor.getAttribute("href") || "").trim();
+        if (!rawHref || rawHref.charAt(0) === "#") {
+            e.preventDefault();
+            return;
+        }
+
+        var resolvedUrl = anchor.href || rawHref;
+        if (/^https?:\/\//i.test(resolvedUrl) && !/^https?:\/\/patcher\.(assets|localhost)(\/|$)/i.test(resolvedUrl)) {
+            e.preventDefault();
+            window.PatcherAPI.openUrl(resolvedUrl);
+        }
+    });
+
     // Allow dragging window from any element with data-patcher-drag or class "drag-area",
     // but NEVER intercept clicks on buttons or interactive controls
     document.addEventListener("mousedown", function(e) {
@@ -112,7 +137,7 @@ const JS_BRIDGE_SCRIPT: &str = r#"
         }
     });
 })();
-"#;
+"##;
 
 const DEFAULT_FALLBACK_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
@@ -463,7 +488,26 @@ fn main() -> anyhow::Result<()> {
     let mut webview_builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_custom_protocol("patcher".into(), protocol_handler)
         .with_initialization_script(&init_script)
-        .with_transparent(config.window.transparent);
+        .with_transparent(config.window.transparent)
+        // Fallback guard: intercept window.open() or target="_blank" links in WebView2
+        .with_new_window_req_handler(|url, _features| {
+            if is_external_http_url(&url) {
+                try_open_external(&url);
+            }
+            NewWindowResponse::Deny
+        })
+        // Fallback guard: prevent direct navigation away from the embedded patcher UI
+        .with_navigation_handler(|url| {
+            if is_internal_patcher_url(&url) {
+                return true;
+            }
+            if is_external_http_url(&url) {
+                try_open_external(&url);
+            } else {
+                log::warn!("Blocked unexpected WebView navigation to {:?}", url);
+            }
+            false
+        });
 
     // Set starting URL
     webview_builder = webview_builder.with_url("patcher://assets/index.html");
@@ -497,6 +541,11 @@ fn main() -> anyhow::Result<()> {
                                 ));
                             }
                         }
+                    }
+                }
+                IpcAction::OpenUrl { url } => {
+                    if let Err(e) = engine_for_ipc.open_url(&url) {
+                        log::warn!("Failed to open external URL {:?}: {:#}", url, e);
                     }
                 }
                 IpcAction::Minimize => {
@@ -668,5 +717,82 @@ fn format_speed(bps: u64) -> String {
         format!("{:.1} KB/s", bps as f64 / 1024.0)
     } else {
         format!("{} B/s", bps)
+    }
+}
+
+/// Returns true if `url` belongs to the embedded `patcher://` custom protocol or a safe local resource URL.
+fn is_internal_patcher_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("patcher://")
+        || lower == "about:blank"
+        || lower.starts_with("about:blank#")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+    {
+        return true;
+    }
+
+    // On Windows/Android, wry maps `patcher://<host>/<path>` to `http(s)://patcher.<host>/<path>`.
+    for prefix in [
+        "http://patcher.assets",
+        "https://patcher.assets",
+        "http://patcher.localhost",
+        "https://patcher.localhost",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns true if `url` is an external HTTP(S) URL that should be opened in the default browser.
+fn is_external_http_url(url: &str) -> bool {
+    if is_internal_patcher_url(url) {
+        return false;
+    }
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn try_open_external(url: &str) {
+    if let Err(e) = open_external_url(url) {
+        log::warn!("Failed to open external URL {:?}: {:#}", url, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_internal_and_external_url_classification() {
+        assert!(is_internal_patcher_url("patcher://assets/index.html"));
+        assert!(is_internal_patcher_url("http://patcher.assets/index.html"));
+        assert!(is_internal_patcher_url("https://patcher.assets/index.html#"));
+        assert!(is_internal_patcher_url("http://patcher.localhost/style.css"));
+        assert!(is_internal_patcher_url("about:blank"));
+
+        assert!(!is_external_http_url("http://patcher.assets/index.html"));
+        assert!(!is_external_http_url("patcher://assets/index.html"));
+        assert!(!is_external_http_url("javascript:alert(1)"));
+        assert!(!is_external_http_url("file:///C:/test.html"));
+
+        assert!(is_external_http_url("https://discord.gg"));
+        assert!(is_external_http_url("http://pronterabox.com/news"));
+        assert!(is_external_http_url("https://patcher.assets.evil.com/phish"));
+    }
+
+    #[test]
+    fn test_ipc_open_url_deserialization() {
+        let json = r#"{"action":"open_url","url":"https://discord.gg"}"#;
+        let parsed: IpcAction = serde_json::from_str(json).expect("open_url IPC JSON should parse");
+        match parsed {
+            IpcAction::OpenUrl { url } => assert_eq!(url, "https://discord.gg"),
+            other => panic!("Expected OpenUrl, got {:?}", other),
+        }
     }
 }
