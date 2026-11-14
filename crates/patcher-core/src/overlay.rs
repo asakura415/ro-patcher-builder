@@ -113,11 +113,13 @@ pub fn create_overlay_zip(config: &PatcherConfig, web_folder: impl AsRef<Path>) 
     let mut buffer = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(&mut buffer);
 
-    let options = SimpleFileOptions::default()
+    let deflated_options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    let stored_options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
 
     // 1. Write config.json
-    zip.start_file("config.json", options)?;
+    zip.start_file("config.json", deflated_options)?;
     let config_json = config.to_json_string()?;
     zip.write_all(config_json.as_bytes())?;
 
@@ -132,7 +134,15 @@ pub fn create_overlay_zip(config: &PatcherConfig, web_folder: impl AsRef<Path>) 
                         continue; // Do not overwrite explicit config
                     }
 
-                    zip.start_file(&rel_str, options)?;
+                    // Compressed audio files (mp3/ogg) don't benefit from deflate and stream faster Stored
+                    let lower_rel = rel_str.to_ascii_lowercase();
+                    let entry_options = if lower_rel.ends_with(".mp3") || lower_rel.ends_with(".ogg") {
+                        stored_options
+                    } else {
+                        deflated_options
+                    };
+
+                    zip.start_file(&rel_str, entry_options)?;
                     let mut file = File::open(path)?;
                     let mut content = Vec::new();
                     file.read_to_end(&mut content)?;
@@ -207,6 +217,8 @@ pub fn guess_mime_type(path: &str) -> String {
         "font/ttf".to_string()
     } else if lower.ends_with(".mp3") {
         "audio/mpeg".to_string()
+    } else if lower.ends_with(".ogg") {
+        "audio/ogg".to_string()
     } else if lower.ends_with(".wav") {
         "audio/wav".to_string()
     } else {
@@ -247,5 +259,32 @@ mod tests {
         assert!(assets.files.contains_key("index.html"));
         assert!(assets.files.contains_key("style.css"));
         assert_eq!(assets.files["index.html"].0, b"<h1>Hello RO</h1>");
+    }
+
+    #[test]
+    fn test_overlay_with_bgm_mp3_and_without() {
+        let config = PatcherConfig::default();
+
+        // Case 1: Theme with assets/bgm.mp3
+        let theme_with_bgm = tempfile::tempdir().unwrap();
+        std::fs::write(theme_with_bgm.path().join("index.html"), b"<h1>Sakura</h1>").unwrap();
+        std::fs::create_dir_all(theme_with_bgm.path().join("assets")).unwrap();
+        let fake_mp3 = b"ID3\x03\x00\x00\x00\x00\x00\x00FAKE_MP3_PAYLOAD";
+        std::fs::write(theme_with_bgm.path().join("assets/bgm.mp3"), fake_mp3).unwrap();
+
+        let payload_with = create_overlay_zip(&config, theme_with_bgm.path()).unwrap();
+        let assets_with = parse_embedded_assets(&payload_with).unwrap();
+        assert!(assets_with.files.contains_key("assets/bgm.mp3"));
+        assert_eq!(assets_with.files["assets/bgm.mp3"].0, fake_mp3);
+        assert_eq!(assets_with.files["assets/bgm.mp3"].1, "audio/mpeg");
+
+        // Case 2: Theme without assets/bgm.mp3 still builds normally
+        let theme_without_bgm = tempfile::tempdir().unwrap();
+        std::fs::write(theme_without_bgm.path().join("index.html"), b"<h1>Cyber</h1>").unwrap();
+
+        let payload_without = create_overlay_zip(&config, theme_without_bgm.path()).unwrap();
+        let assets_without = parse_embedded_assets(&payload_without).unwrap();
+        assert!(assets_without.files.contains_key("index.html"));
+        assert!(!assets_without.files.contains_key("assets/bgm.mp3"));
     }
 }

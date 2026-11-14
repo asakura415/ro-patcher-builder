@@ -614,6 +614,56 @@ document.addEventListener("DOMContentLoaded", async function() {
         });
     }
 
+    // --- Theme BGM Inspector Status ---
+    const themeBgmStatus = document.getElementById("themeBgmStatus");
+    const themeBgmIcon = document.getElementById("themeBgmIcon");
+    const themeBgmTitle = document.getElementById("themeBgmTitle");
+    const themeBgmDesc = document.getElementById("themeBgmDesc");
+    let bgmInspectToken = 0;
+
+    function getSelectedThemeFolder() {
+        const customInput = document.getElementById("customThemeFolder");
+        const val = customInput ? customInput.value.trim() : "";
+        if (val) return val;
+        const activeCard = document.querySelector(".theme-card.active");
+        return activeCard ? (activeCard.getAttribute("data-theme") || "themes/modern-cyber") : "themes/modern-cyber";
+    }
+
+    async function refreshThemeBgmStatus() {
+        if (!themeBgmStatus || !themeBgmTitle || !themeBgmDesc || !themeBgmIcon) return;
+        const token = ++bgmInspectToken;
+        const folderPath = getSelectedThemeFolder();
+        try {
+            const info = await invoke("inspect_theme_folder", { themeFolderPath: folderPath });
+            if (token !== bgmInspectToken) return;
+
+            themeBgmStatus.classList.remove("has-bgm", "no-bgm", "is-warning");
+            if (!info || !info.exists || !info.has_index_html) {
+                themeBgmStatus.classList.add("is-warning");
+                themeBgmIcon.innerHTML = "&#9888;&#65039;";
+                themeBgmTitle.innerText = window.I18N ? I18N.t("bgmStatusMissingTitle") : "Theme Folder Not Found";
+                themeBgmDesc.innerText = window.I18N ? I18N.t("bgmStatusMissingDesc") : "Please check the theme folder path.";
+            } else if (info.has_bgm) {
+                const sizeMb = info.bgm_size_bytes ? (info.bgm_size_bytes / (1024 * 1024)).toFixed(2) : "0.00";
+                const relPath = info.bgm_relative_path || "assets/bgm.mp3";
+                const descTemplate = window.I18N
+                    ? I18N.t("bgmStatusDetectedDesc")
+                    : "Found {path} ({size} MB) — will be embedded automatically.";
+                themeBgmStatus.classList.add("has-bgm");
+                themeBgmIcon.innerHTML = "&#127925;";
+                themeBgmTitle.innerText = window.I18N ? I18N.t("bgmStatusDetectedTitle") : "Background Music Detected";
+                themeBgmDesc.innerText = descTemplate.replace("{path}", relPath).replace("{size}", sizeMb);
+            } else {
+                themeBgmStatus.classList.add("no-bgm");
+                themeBgmIcon.innerHTML = "&#128263;";
+                themeBgmTitle.innerText = window.I18N ? I18N.t("bgmStatusNoneTitle") : "No Background Music (Optional)";
+                themeBgmDesc.innerText = window.I18N ? I18N.t("bgmStatusNoneDesc") : "assets/bgm.mp3 not found — patcher generates normally.";
+            }
+        } catch (err) {
+            console.debug("Theme BGM inspect skipped:", err);
+        }
+    }
+
     // --- Language Switcher (EN / TH) ---
     const btnLangToggle = document.getElementById("btnLangToggle");
     if (btnLangToggle) {
@@ -628,6 +678,7 @@ document.addEventListener("DOMContentLoaded", async function() {
                 }
                 const currentTheme = document.documentElement.getAttribute("data-theme") || "dark";
                 applyTheme(currentTheme);
+                refreshThemeBgmStatus();
             }
         });
     }
@@ -648,6 +699,7 @@ document.addEventListener("DOMContentLoaded", async function() {
             if (customThemeFolderInput) {
                 customThemeFolderInput.value = themePath;
             }
+            refreshThemeBgmStatus();
         });
     });
 
@@ -662,8 +714,11 @@ document.addEventListener("DOMContentLoaded", async function() {
                     card.classList.remove("active");
                 }
             });
+            refreshThemeBgmStatus();
         });
     }
+
+    await refreshThemeBgmStatus();
 
     // --- File / Folder Browse Buttons ---
     document.querySelectorAll(".btn-browse").forEach(btn => {

@@ -47,6 +47,236 @@ const JS_BRIDGE_SCRIPT: &str = r##"
     var _lastStatus = null;
     var _lastData = null;
 
+    // ---------------------------------------------------------
+    // Centralized BGM Runtime (Declarative + Custom + Fallback)
+    // ---------------------------------------------------------
+    var _bgmAudio = null;
+    var _bgmMuted = false;
+    var _bgmVolume = 0.35;
+    var _bgmCustomMode = false;
+    var _bgmListeners = [];
+    var _bgmToggles = [];
+    var _bgmFloatingHost = null;
+    var _bgmFloatingBtn = null;
+    var _bgmRetryBound = false;
+
+    function _getConfig() {
+        return (window.PatcherAPI && window.PatcherAPI.config) || {};
+    }
+
+    function _getBgmUrl() {
+        var cfg = _getConfig();
+        return (typeof cfg.bgm_url === "string" && cfg.bgm_url.trim().length > 0)
+            ? cfg.bgm_url.trim()
+            : null;
+    }
+
+    function _getBgmStorageKey() {
+        var title = (_getConfig().title || "default").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        return "patcher-bgm-muted:" + title;
+    }
+
+    function _loadMutedPref() {
+        try {
+            return localStorage.getItem(_getBgmStorageKey()) === "muted";
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function _saveMutedPref(muted) {
+        try {
+            localStorage.setItem(_getBgmStorageKey(), muted ? "muted" : "enabled");
+        } catch (e) {}
+    }
+
+    function _getBgmState() {
+        var url = _getBgmUrl();
+        return {
+            available: Boolean(url),
+            muted: _bgmMuted,
+            playing: Boolean(_bgmAudio && !_bgmAudio.paused && !_bgmAudio.muted),
+            volume: _bgmVolume,
+            url: url
+        };
+    }
+
+    function _updateToggleElement(el) {
+        if (!el) return;
+        var available = Boolean(_getBgmUrl());
+        el.hidden = !available;
+        el.setAttribute("aria-pressed", String(!_bgmMuted));
+        el.classList.toggle("is-muted", _bgmMuted);
+        if (el.hasAttribute("data-bgm-auto-icon")) {
+            el.innerHTML = _bgmMuted ? "&#128263;" : "&#128266;";
+            el.title = _bgmMuted ? "Unmute BGM" : "Mute BGM";
+        }
+    }
+
+    function _updateFloatingButton() {
+        if (!_bgmFloatingBtn) return;
+        _bgmFloatingBtn.setAttribute("aria-pressed", String(!_bgmMuted));
+        _bgmFloatingBtn.setAttribute("title", _bgmMuted ? "Unmute BGM" : "Mute BGM");
+        _bgmFloatingBtn.classList.toggle("muted", _bgmMuted);
+        _bgmFloatingBtn.textContent = _bgmMuted ? "\uD83D\uDD07 BGM OFF" : "\uD83C\uDFB5 BGM ON";
+    }
+
+    function _notifyBgmListeners() {
+        for (var i = 0; i < _bgmToggles.length; i++) {
+            _updateToggleElement(_bgmToggles[i]);
+        }
+        _updateFloatingButton();
+        var state = _getBgmState();
+        for (var j = 0; j < _bgmListeners.length; j++) {
+            try { _bgmListeners[j](state); } catch (e) { console.error(e); }
+        }
+    }
+
+    function _removeFloatingControl() {
+        if (_bgmFloatingHost && _bgmFloatingHost.parentNode) {
+            _bgmFloatingHost.parentNode.removeChild(_bgmFloatingHost);
+        }
+        _bgmFloatingHost = null;
+        _bgmFloatingBtn = null;
+    }
+
+    function _mountFloatingControl() {
+        if (_bgmFloatingHost || _bgmCustomMode || _bgmToggles.length > 0 || !_getBgmUrl() || !document.body) {
+            return;
+        }
+        var metaCustom = document.querySelector('meta[name="patcher-bgm-ui"][content="custom"]');
+        if (metaCustom) {
+            _bgmCustomMode = true;
+            return;
+        }
+
+        var host = document.createElement("div");
+        host.id = "patcher-bgm-host";
+        host.className = "no-drag";
+        host.style.cssText = "position:fixed;top:46px;right:14px;z-index:2147483647;pointer-events:auto;";
+        var shadow = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
+
+        var style = document.createElement("style");
+        style.textContent =
+            "button{all:unset;box-sizing:border-box;cursor:pointer;display:inline-flex;align-items:center;gap:5px;" +
+            "padding:4px 10px;border-radius:999px;font:600 11px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
+            "color:#f8fafc;background:rgba(15,23,42,0.72);border:1px solid rgba(255,255,255,0.22);" +
+            "backdrop-filter:blur(8px);box-shadow:0 4px 12px rgba(0,0,0,0.3);transition:all .18s ease;user-select:none;}" +
+            "button:hover{background:rgba(30,41,59,0.9);border-color:rgba(255,255,255,0.45);transform:translateY(-1px);}" +
+            "button.muted{color:#cbd5e1;opacity:0.8;}";
+
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.addEventListener("click", function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            bgmController.toggle();
+        });
+
+        shadow.appendChild(style);
+        shadow.appendChild(btn);
+        document.body.appendChild(host);
+        _bgmFloatingHost = host;
+        _bgmFloatingBtn = btn;
+        _updateFloatingButton();
+    }
+
+    function _attemptPlay() {
+        if (!_bgmAudio || _bgmMuted) return;
+        _bgmAudio.muted = false;
+        _bgmAudio.volume = _bgmVolume;
+        var p = _bgmAudio.play();
+        if (p && typeof p.catch === "function") {
+            p.catch(function() {
+                if (_bgmRetryBound) return;
+                _bgmRetryBound = true;
+                var retry = function() {
+                    document.removeEventListener("pointerdown", retry, true);
+                    document.removeEventListener("keydown", retry, true);
+                    _bgmRetryBound = false;
+                    if (_bgmAudio && !_bgmMuted) {
+                        _bgmAudio.play().catch(function() {});
+                    }
+                };
+                document.addEventListener("pointerdown", retry, true);
+                document.addEventListener("keydown", retry, true);
+            });
+        }
+    }
+
+    var bgmController = {
+        isAvailable: function() {
+            return Boolean(_getBgmUrl());
+        },
+        isMuted: function() {
+            return _bgmMuted;
+        },
+        isPlaying: function() {
+            return _getBgmState().playing;
+        },
+        getVolume: function() {
+            return _bgmVolume;
+        },
+        setVolume: function(vol) {
+            var num = Number(vol);
+            if (!isFinite(num)) return;
+            _bgmVolume = Math.max(0, Math.min(1, num));
+            if (_bgmAudio) {
+                _bgmAudio.volume = _bgmVolume;
+            }
+            _notifyBgmListeners();
+        },
+        mute: function(persist) {
+            _bgmMuted = true;
+            if (persist !== false) _saveMutedPref(true);
+            if (_bgmAudio) {
+                _bgmAudio.muted = true;
+                _bgmAudio.pause();
+            }
+            _notifyBgmListeners();
+        },
+        unmute: function(persist) {
+            _bgmMuted = false;
+            if (persist !== false) _saveMutedPref(false);
+            _attemptPlay();
+            _notifyBgmListeners();
+        },
+        toggle: function() {
+            if (_bgmMuted) {
+                bgmController.unmute(true);
+            } else {
+                bgmController.mute(true);
+            }
+            return _bgmMuted;
+        },
+        setCustomMode: function(enabled) {
+            _bgmCustomMode = Boolean(enabled);
+            if (_bgmCustomMode) {
+                _removeFloatingControl();
+            }
+        },
+        disableFloatingButton: function() {
+            bgmController.setCustomMode(true);
+        },
+        bindToggle: function(el) {
+            if (!el || _bgmToggles.indexOf(el) !== -1) return;
+            _bgmToggles.push(el);
+            el.addEventListener("click", function(e) {
+                e.preventDefault();
+                bgmController.toggle();
+            });
+            _updateToggleElement(el);
+            if (_bgmToggles.length > 0) {
+                _removeFloatingControl();
+            }
+        },
+        onChange: function(fn) {
+            if (typeof fn !== "function") return;
+            _bgmListeners.push(fn);
+            try { fn(_getBgmState()); } catch (e) { console.error(e); }
+        }
+    };
+
     window.PatcherAPI = {
         startGame: function() {
             window.ipc.postMessage(JSON.stringify({ action: "start_game" }));
@@ -61,6 +291,7 @@ const JS_BRIDGE_SCRIPT: &str = r##"
             window.ipc.postMessage(JSON.stringify({ action: "force_repatch" }));
         },
         restart: function() {
+            if (_bgmAudio) _bgmAudio.pause();
             window.ipc.postMessage(JSON.stringify({ action: "restart" }));
         },
         requestAdmin: function() {
@@ -72,6 +303,7 @@ const JS_BRIDGE_SCRIPT: &str = r##"
             }
         },
         close: function() {
+            if (_bgmAudio) _bgmAudio.pause();
             window.ipc.postMessage(JSON.stringify({ action: "close" }));
         },
         minimize: function() {
@@ -80,6 +312,7 @@ const JS_BRIDGE_SCRIPT: &str = r##"
         dragWindow: function() {
             window.ipc.postMessage(JSON.stringify({ action: "drag_window" }));
         },
+        bgm: bgmController,
         get onStatusChange() {
             return _callback;
         },
@@ -97,6 +330,42 @@ const JS_BRIDGE_SCRIPT: &str = r##"
             }
         }
     };
+
+    document.addEventListener("DOMContentLoaded", function() {
+        var bgmUrl = _getBgmUrl();
+        var declarativeButtons = document.querySelectorAll("[data-bgm-toggle]");
+
+        if (!bgmUrl) {
+            declarativeButtons.forEach(function(btn) {
+                btn.hidden = true;
+            });
+            _notifyBgmListeners();
+            return;
+        }
+
+        _bgmMuted = _loadMutedPref();
+        var audio = new Audio(bgmUrl);
+        audio.loop = true;
+        audio.preload = "auto";
+        audio.volume = _bgmVolume;
+        audio.muted = _bgmMuted;
+        audio.addEventListener("play", _notifyBgmListeners);
+        audio.addEventListener("pause", _notifyBgmListeners);
+        _bgmAudio = audio;
+        window.__patcherBgmAudio = audio;
+
+        declarativeButtons.forEach(function(btn) {
+            bgmController.bindToggle(btn);
+        });
+
+        _attemptPlay();
+        _notifyBgmListeners();
+
+        // Mount zero-config Shadow DOM toggle only after theme DOMContentLoaded scripts run
+        setTimeout(function() {
+            _mountFloatingControl();
+        }, 0);
+    });
 
     // Intercept clicks on external HTTP(S) links so they open in the system's default browser
     document.addEventListener("click", function(e) {
@@ -434,28 +703,19 @@ fn main() -> anyhow::Result<()> {
             normalized
         };
 
-        let found_asset = if !raw_trimmed.is_empty() {
-            assets_for_protocol
-                .get(raw_trimmed)
-                .or_else(|| assets_for_protocol.get(lookup_key))
-        } else {
-            assets_for_protocol.get(lookup_key)
-        };
+        let found_asset = find_embedded_asset(&assets_for_protocol, raw_trimmed, lookup_key);
 
         if let Some((bytes, mime)) = found_asset {
-            Response::builder()
-                .header("Content-Type", mime.as_str())
-                .body(Cow::Owned(bytes.clone()))
-                .unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(500)
-                        .body(Cow::Borrowed(b"500 Internal Error".as_slice()))
-                        .unwrap()
-                })
+            let range_header = req
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok());
+            build_asset_response(bytes, mime, range_header)
         } else if lookup_key == "index.html" && assets_for_protocol.is_empty() {
             // Default fallback page
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
+                .header("Content-Length", DEFAULT_FALLBACK_HTML.len())
                 .body(Cow::Borrowed(DEFAULT_FALLBACK_HTML.as_bytes()))
                 .unwrap()
         } else {
@@ -475,10 +735,12 @@ fn main() -> anyhow::Result<()> {
     let mut web_context = WebContext::new(Some(webview_data_dir));
 
     let is_admin = is_running_as_admin();
+    let bgm_url = find_bgm_asset(&assets_arc);
     let client_cfg_json = serde_json::json!({
         "title": config.window.title,
         "notice_url": config.server.notice_url,
         "is_admin": is_admin,
+        "bgm_url": bgm_url,
     });
     let init_script = format!(
         "{}\nwindow.PatcherAPI.config = {};",
@@ -764,6 +1026,139 @@ fn try_open_external(url: &str) {
     }
 }
 
+/// Finds `assets/bgm.mp3` inside embedded assets (case-insensitive) and returns its canonical relative URL.
+fn find_bgm_asset(assets: &HashMap<String, (Vec<u8>, String)>) -> Option<String> {
+    if assets.contains_key("assets/bgm.mp3") {
+        return Some("assets/bgm.mp3".to_string());
+    }
+    assets
+        .keys()
+        .find(|k| k.replace('\\', "/").eq_ignore_ascii_case("assets/bgm.mp3"))
+        .map(|k| k.replace('\\', "/"))
+}
+
+/// Looks up an embedded asset by exact path first, then normalized path, then case-insensitive match.
+fn find_embedded_asset<'a>(
+    assets: &'a HashMap<String, (Vec<u8>, String)>,
+    raw_trimmed: &str,
+    lookup_key: &str,
+) -> Option<&'a (Vec<u8>, String)> {
+    if !raw_trimmed.is_empty() {
+        if let Some(hit) = assets.get(raw_trimmed).or_else(|| assets.get(lookup_key)) {
+            return Some(hit);
+        }
+        return assets.iter().find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case(raw_trimmed) || k.eq_ignore_ascii_case(lookup_key) {
+                Some(v)
+            } else {
+                None
+            }
+        });
+    }
+    assets.get(lookup_key)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedRange {
+    Valid(usize, usize),
+    Unsatisfiable,
+}
+
+/// Parses an HTTP `Range: bytes=...` header into an inclusive `(start, end)` byte range.
+fn parse_byte_range(range_header: &str, total_len: usize) -> Option<ParsedRange> {
+    if total_len == 0 {
+        return Some(ParsedRange::Unsatisfiable);
+    }
+    let trimmed = range_header.trim();
+    let spec = trimmed
+        .strip_prefix("bytes=")
+        .or_else(|| trimmed.strip_prefix("BYTES="))?;
+    // Handle single range (first range if comma-separated)
+    let first_range = spec.split(',').next()?.trim();
+    let (start_str, end_str) = first_range.split_once('-')?;
+
+    if start_str.is_empty() {
+        // Suffix range: bytes=-N
+        let suffix_len: usize = end_str.trim().parse().ok()?;
+        if suffix_len == 0 {
+            return Some(ParsedRange::Unsatisfiable);
+        }
+        let start = total_len.saturating_sub(suffix_len);
+        return Some(ParsedRange::Valid(start, total_len - 1));
+    }
+
+    let start: usize = start_str.trim().parse().ok()?;
+    if start >= total_len {
+        return Some(ParsedRange::Unsatisfiable);
+    }
+
+    let end = if end_str.trim().is_empty() {
+        total_len - 1
+    } else {
+        let parsed_end: usize = end_str.trim().parse().ok()?;
+        if parsed_end < start {
+            return Some(ParsedRange::Unsatisfiable);
+        }
+        parsed_end.min(total_len - 1)
+    };
+
+    Some(ParsedRange::Valid(start, end))
+}
+
+/// Builds a 200 OK or 206 Partial Content HTTP response for embedded assets (important for WebView2 `<audio>` streaming).
+fn build_asset_response(
+    bytes: &[u8],
+    mime: &str,
+    range_header: Option<&str>,
+) -> Response<Cow<'static, [u8]>> {
+    let total_len = bytes.len();
+
+    if let Some(range_val) = range_header {
+        match parse_byte_range(range_val, total_len) {
+            Some(ParsedRange::Valid(start, end)) => {
+                let slice = &bytes[start..=end];
+                let content_range = format!("bytes {}-{}/{}", start, end, total_len);
+                return Response::builder()
+                    .status(206)
+                    .header("Content-Type", mime)
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Range", content_range)
+                    .header("Content-Length", slice.len())
+                    .body(Cow::Owned(slice.to_vec()))
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(500)
+                            .body(Cow::Borrowed(b"500 Internal Error".as_slice()))
+                            .unwrap()
+                    });
+            }
+            Some(ParsedRange::Unsatisfiable) => {
+                return Response::builder()
+                    .status(416)
+                    .header("Content-Range", format!("bytes */{}", total_len))
+                    .body(Cow::Borrowed(b"Range Not Satisfiable".as_slice()))
+                    .unwrap();
+            }
+            None => {
+                // Malformed/unknown unit -> fall through to full 200 OK per RFC 9110
+            }
+        }
+    }
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", mime)
+        .header("Accept-Ranges", "bytes")
+        .header("Content-Length", total_len)
+        .body(Cow::Owned(bytes.to_vec()))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(500)
+                .body(Cow::Borrowed(b"500 Internal Error".as_slice()))
+                .unwrap()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +1189,55 @@ mod tests {
             IpcAction::OpenUrl { url } => assert_eq!(url, "https://discord.gg"),
             other => panic!("Expected OpenUrl, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_find_bgm_asset_case_insensitive_and_optional() {
+        let mut assets = HashMap::new();
+        assets.insert("index.html".to_string(), (b"<html></html>".to_vec(), "text/html".to_string()));
+        assert_eq!(find_bgm_asset(&assets), None);
+
+        assets.insert("assets/BGM.MP3".to_string(), (vec![1, 2, 3], "audio/mpeg".to_string()));
+        assert_eq!(find_bgm_asset(&assets).as_deref(), Some("assets/BGM.MP3"));
+
+        let hit = find_embedded_asset(&assets, "assets/bgm.mp3", "bgm.mp3");
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().0, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_byte_range_and_build_asset_response() {
+        let data: Vec<u8> = (0..100).collect();
+
+        // Full 200 response
+        let full = build_asset_response(&data, "audio/mpeg", None);
+        assert_eq!(full.status().as_u16(), 200);
+        assert_eq!(full.headers().get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(full.headers().get("content-length").unwrap(), "100");
+        assert_eq!(full.body().len(), 100);
+
+        // Open-ended range `bytes=0-`
+        let open = build_asset_response(&data, "audio/mpeg", Some("bytes=0-"));
+        assert_eq!(open.status().as_u16(), 206);
+        assert_eq!(open.headers().get("content-range").unwrap(), "bytes 0-99/100");
+        assert_eq!(open.body().len(), 100);
+
+        // Closed subrange `bytes=10-19`
+        let partial = build_asset_response(&data, "audio/mpeg", Some("bytes=10-19"));
+        assert_eq!(partial.status().as_u16(), 206);
+        assert_eq!(partial.headers().get("content-range").unwrap(), "bytes 10-19/100");
+        assert_eq!(partial.headers().get("content-length").unwrap(), "10");
+        assert_eq!(partial.body().as_ref(), &(10..20).collect::<Vec<u8>>()[..]);
+
+        // Suffix range `bytes=-5`
+        let suffix = build_asset_response(&data, "audio/mpeg", Some("bytes=-5"));
+        assert_eq!(suffix.status().as_u16(), 206);
+        assert_eq!(suffix.headers().get("content-range").unwrap(), "bytes 95-99/100");
+        assert_eq!(suffix.body().as_ref(), &[95, 96, 97, 98, 99]);
+
+        // Unsatisfiable range `bytes=200-`
+        let oob = build_asset_response(&data, "audio/mpeg", Some("bytes=200-"));
+        assert_eq!(oob.status().as_u16(), 416);
+        assert_eq!(oob.headers().get("content-range").unwrap(), "bytes */100");
     }
 }

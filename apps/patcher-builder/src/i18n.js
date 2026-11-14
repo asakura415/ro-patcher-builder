@@ -74,6 +74,12 @@ const I18N = {
             themeAnimeTitle: "Sakura Anime Fantasy",
             themeAnimeDesc: "Japanese anime fantasy style, floating sakura petals, sweet sound effects, and mascot artwork.",
             labelCustomThemeFolder: "Or Custom Web Theme Folder Path",
+            bgmStatusDetectedTitle: "Background Music (BGM) Detected",
+            bgmStatusDetectedDesc: "Found {path} ({size} MB) — will be embedded and played automatically with a mute toggle.",
+            bgmStatusNoneTitle: "No Background Music (Optional)",
+            bgmStatusNoneDesc: "assets/bgm.mp3 was not found in this theme — patcher will generate normally without music.",
+            bgmStatusMissingTitle: "Theme Folder Not Found or Missing index.html",
+            bgmStatusMissingDesc: "Please check the theme folder path before generating.",
 
             // Tab 4: Patch Maker
             cardCreateThor: "Create THOR Patch (.thor)",
@@ -226,6 +232,12 @@ const I18N = {
             themeAnimeTitle: "Sakura Anime Fantasy (ธีมอนิเมะญี่ปุ่น)",
             themeAnimeDesc: "สไตล์อนิเมะแฟนตาซี กลีบซากุระร่วงปลิวสมจริง เอฟเฟกต์เสียงน่ารัก พร้อมภาพมาสคอตและแบนเนอร์สวยงาม",
             labelCustomThemeFolder: "หรือเลือกโฟลเดอร์ธีมแบบกำหนดเอง (HTML/CSS)",
+            bgmStatusDetectedTitle: "ตรวจพบเพลงประกอบ Background Music (BGM)",
+            bgmStatusDetectedDesc: "พบไฟล์ {path} ({size} MB) — จะฝังลงใน Patcher และเล่นอัตโนมัติพร้อมปุ่มเปิด/ปิดเสียง",
+            bgmStatusNoneTitle: "ไม่มีเพลงประกอบ (ไม่บังคับ)",
+            bgmStatusNoneDesc: "ไม่พบไฟล์ assets/bgm.mp3 ในธีมนี้ — สามารถ Generate Patcher ได้ตามปกติโดยไม่มีเสียงเพลง",
+            bgmStatusMissingTitle: "ไม่พบโฟลเดอร์ธีม หรือไม่มีไฟล์ index.html",
+            bgmStatusMissingDesc: "กรุณาตรวจสอบพาธโฟลเดอร์ธีมให้ถูกต้องก่อนทำการ Generate",
 
             // Tab 4: Patch Maker
             cardCreateThor: "สร้างไฟล์แพตช์ THOR (.thor)",

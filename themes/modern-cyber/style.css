@@ -165,6 +165,18 @@ body {
     color: #fff;
 }
 
+.win-btn.sound-toggle {
+    font-size: 13px;
+}
+
+.win-btn.sound-toggle[hidden] {
+    display: none;
+}
+
+.win-btn.sound-toggle.is-muted {
+    opacity: 0.6;
+}
+
 /* Main */
 .main-content {
     flex: 1;

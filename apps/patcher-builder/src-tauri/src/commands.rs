@@ -74,6 +74,100 @@ pub struct GameDirScanResult {
     pub found_icons: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ThemeInspectResult {
+    pub resolved_path: String,
+    pub exists: bool,
+    pub has_index_html: bool,
+    pub has_bgm: bool,
+    pub bgm_relative_path: Option<String>,
+    pub bgm_size_bytes: Option<u64>,
+}
+
+/// Inspects a theme directory for `index.html` and optional `assets/bgm.mp3` (case-insensitive).
+pub fn inspect_theme_dir(theme_dir: &Path) -> ThemeInspectResult {
+    let display_path = fs::canonicalize(theme_dir)
+        .unwrap_or_else(|_| theme_dir.to_path_buf())
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+
+    if !theme_dir.exists() || !theme_dir.is_dir() {
+        return ThemeInspectResult {
+            resolved_path: display_path,
+            exists: false,
+            has_index_html: false,
+            has_bgm: false,
+            bgm_relative_path: None,
+            bgm_size_bytes: None,
+        };
+    }
+
+    let mut has_index_html = false;
+    let mut assets_subdir: Option<(String, PathBuf)> = None;
+
+    if let Ok(entries) = fs::read_dir(theme_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            if path.is_file() && name.eq_ignore_ascii_case("index.html") {
+                has_index_html = true;
+            } else if path.is_dir() && name.eq_ignore_ascii_case("assets") {
+                assets_subdir = Some((name, path));
+            }
+        }
+    }
+
+    let mut has_bgm = false;
+    let mut bgm_relative_path = None;
+    let mut bgm_size_bytes = None;
+
+    if let Some((assets_dir_name, assets_path)) = assets_subdir {
+        if let Ok(entries) = fs::read_dir(&assets_path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+                if path.is_file() && name.eq_ignore_ascii_case("bgm.mp3") {
+                    has_bgm = true;
+                    bgm_relative_path = Some(format!("{}/{}", assets_dir_name, name));
+                    bgm_size_bytes = fs::metadata(&path).ok().map(|m| m.len());
+                    break;
+                }
+            }
+        }
+    }
+
+    ThemeInspectResult {
+        resolved_path: display_path,
+        exists: true,
+        has_index_html,
+        has_bgm,
+        bgm_relative_path,
+        bgm_size_bytes,
+    }
+}
+
+#[tauri::command]
+pub fn inspect_theme_folder(theme_folder_path: Option<String>) -> ThemeInspectResult {
+    let raw = theme_folder_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("themes/modern-cyber");
+
+    match resolve_project_path(raw) {
+        Some(resolved) => inspect_theme_dir(&resolved),
+        None => ThemeInspectResult {
+            resolved_path: raw.to_string(),
+            exists: false,
+            has_index_html: false,
+            has_bgm: false,
+            bgm_relative_path: None,
+            bgm_size_bytes: None,
+        },
+    }
+}
+
 #[tauri::command]
 pub fn get_default_config() -> PatcherConfig {
     let mut config = PatcherConfig::default();
@@ -848,5 +942,60 @@ pub async fn import_delete_list_file(window: tauri::WebviewWindow) -> Result<Vec
     {
         let _ = window;
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "patcher_builder_test_{}_{}",
+                name,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_inspect_theme_dir_with_and_without_bgm() {
+        let with_bgm = TempDirGuard::new("with_bgm");
+        std::fs::write(with_bgm.0.join("index.html"), b"<html></html>").unwrap();
+        std::fs::create_dir_all(with_bgm.0.join("assets")).unwrap();
+        std::fs::write(with_bgm.0.join("assets/BGM.mp3"), b"123456").unwrap();
+
+        let res_with = inspect_theme_dir(&with_bgm.0);
+        assert!(res_with.exists);
+        assert!(res_with.has_index_html);
+        assert!(res_with.has_bgm);
+        assert_eq!(res_with.bgm_relative_path.as_deref(), Some("assets/BGM.mp3"));
+        assert_eq!(res_with.bgm_size_bytes, Some(6));
+
+        let without_bgm = TempDirGuard::new("without_bgm");
+        std::fs::write(without_bgm.0.join("index.html"), b"<html></html>").unwrap();
+
+        let res_without = inspect_theme_dir(&without_bgm.0);
+        assert!(res_without.exists);
+        assert!(res_without.has_index_html);
+        assert!(!res_without.has_bgm);
+        assert_eq!(res_without.bgm_relative_path, None);
+        assert_eq!(res_without.bgm_size_bytes, None);
+
+        let missing = inspect_theme_dir(&without_bgm.0.join("does-not-exist"));
+        assert!(!missing.exists);
+        assert!(!missing.has_bgm);
     }
 }

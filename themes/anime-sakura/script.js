@@ -42,15 +42,32 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     // ------------------------------------------
-    // 1. Web Audio UI Synthesizer (Anime SFX)
+    // 1. Web Audio UI Synthesizer (Anime SFX) + BGM Integration
     // ------------------------------------------
     let audioCtx = null;
     let soundEnabled = localStorage.getItem("anime-patcher-sound") !== "muted";
+    const bgmApi = window.PatcherAPI && window.PatcherAPI.bgm;
+    const hasBgm = Boolean(bgmApi && bgmApi.isAvailable());
+
+    if (bgmApi) {
+        bgmApi.setCustomMode(true);
+        if (hasBgm) {
+            if (soundEnabled) {
+                bgmApi.unmute(false);
+            } else {
+                bgmApi.mute(false);
+            }
+        }
+    }
 
     function updateSoundIcon() {
         if (btnSoundToggle) {
             btnSoundToggle.innerHTML = soundEnabled ? "&#128266;" : "&#128263;";
-            btnSoundToggle.title = soundEnabled ? "Mute Sound" : "Enable Sound";
+            btnSoundToggle.setAttribute("aria-pressed", String(soundEnabled));
+            btnSoundToggle.classList.toggle("is-muted", !soundEnabled);
+            btnSoundToggle.title = hasBgm
+                ? (soundEnabled ? "Mute BGM & Sound" : "Enable BGM & Sound")
+                : (soundEnabled ? "Mute Sound" : "Enable Sound");
         }
     }
     updateSoundIcon();
@@ -59,6 +76,13 @@ document.addEventListener("DOMContentLoaded", function () {
         btnSoundToggle.addEventListener("click", () => {
             soundEnabled = !soundEnabled;
             localStorage.setItem("anime-patcher-sound", soundEnabled ? "enabled" : "muted");
+            if (bgmApi && hasBgm) {
+                if (soundEnabled) {
+                    bgmApi.unmute(true);
+                } else {
+                    bgmApi.mute(true);
+                }
+            }
             updateSoundIcon();
             if (soundEnabled) playChime(880, 0.08);
         });
