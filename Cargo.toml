@@ -7,3 +7,9 @@ members = [
     "apps/patcher-builder/src-tauri",
 ]
 resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

@@ -11,7 +11,6 @@ patcher-core = { path = "../patcher-core" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
 walkdir = "2.5"
 anyhow = "1.0"
 log = "0.4"

@@ -2,9 +2,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tao::dpi::LogicalSize;
@@ -15,8 +15,31 @@ use wry::{http::Response, NewWindowResponse, WebContext, WebView, WebViewBuilder
 
 use patcher_core::config::PatcherConfig;
 use patcher_core::launcher::{cleanup_self_update_backup, is_running_as_admin, open_external_url};
-use patcher_core::overlay::{parse_embedded_assets, read_overlay_from_current_exe};
+use patcher_core::overlay::{compute_sha256, parse_embedded_assets, read_overlay_from_current_exe};
 use patcher_core::{EngineStatus, PatcherEngine};
+
+static EMBEDDED_ASSETS: OnceLock<AssetStore> = OnceLock::new();
+
+#[derive(Debug)]
+struct AssetStore {
+    files: HashMap<String, (Vec<u8>, String)>,
+    lower_index: HashMap<String, String>,
+}
+
+impl AssetStore {
+    fn new(files: HashMap<String, (Vec<u8>, String)>) -> Self {
+        let mut lower_index = HashMap::with_capacity(files.len());
+        for key in files.keys() {
+            let lower = key.replace('\\', "/").to_ascii_lowercase();
+            lower_index.entry(lower).or_insert_with(|| key.clone());
+        }
+        Self { files, lower_index }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -663,7 +686,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let assets_arc = Arc::new(assets_map);
+    let assets_store: &'static AssetStore = EMBEDDED_ASSETS.get_or_init(|| AssetStore::new(assets_map));
 
     // 3. Initialize Tao Event Loop
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -688,8 +711,7 @@ fn main() -> anyhow::Result<()> {
     let proxy_for_ipc = proxy.clone();
     let is_patching = Arc::new(AtomicBool::new(false));
 
-    // Custom protocol handler serving embedded assets or fallback HTML
-    let assets_for_protocol = assets_arc.clone();
+    // Custom protocol handler serving embedded assets or fallback HTML (zero-copy via OnceLock)
     let protocol_handler = move |_id: wry::WebViewId, req: wry::http::Request<Vec<u8>>| {
         let uri_path = req.uri().path();
         let raw_trimmed = uri_path.trim_start_matches('/');
@@ -703,48 +725,55 @@ fn main() -> anyhow::Result<()> {
             normalized
         };
 
-        let found_asset = find_embedded_asset(&assets_for_protocol, raw_trimmed, lookup_key);
+        if is_blocked_asset_path(raw_trimmed, lookup_key) {
+            return Response::builder()
+                .status(404)
+                .header("X-Content-Type-Options", "nosniff")
+                .body(Cow::Borrowed(b"404 Not Found".as_slice()))
+                .unwrap();
+        }
+
+        let found_asset = find_embedded_asset(assets_store, raw_trimmed, lookup_key);
 
         if let Some((bytes, mime)) = found_asset {
             let range_header = req
                 .headers()
                 .get("range")
                 .and_then(|v| v.to_str().ok());
-            build_asset_response(bytes, mime, range_header)
-        } else if lookup_key == "index.html" && assets_for_protocol.is_empty() {
+            build_asset_response(bytes.as_slice(), mime, range_header)
+        } else if lookup_key == "index.html" && assets_store.is_empty() {
             // Default fallback page
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
                 .header("Content-Length", DEFAULT_FALLBACK_HTML.len())
+                .header("X-Content-Type-Options", "nosniff")
                 .body(Cow::Borrowed(DEFAULT_FALLBACK_HTML.as_bytes()))
                 .unwrap()
         } else {
             Response::builder()
                 .status(404)
+                .header("X-Content-Type-Options", "nosniff")
                 .body(Cow::Borrowed(b"404 Not Found".as_slice()))
                 .unwrap()
         }
     };
 
-    // 6. Build Wry WebView using a dedicated WebContext in %LOCALAPPDATA% so we never pollute the game folder with `<exe>.WebView2`
-    let webview_data_dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ModernROPatcher")
-        .join("WebView2");
+    // 6. Build Wry WebView using an isolated profile dir in %LOCALAPPDATA% so we never pollute the game folder with `<exe>.WebView2`
+    let webview_data_dir = compute_webview_data_dir(&config, &game_dir);
     let mut web_context = WebContext::new(Some(webview_data_dir));
 
     let is_admin = is_running_as_admin();
-    let bgm_url = find_bgm_asset(&assets_arc);
+    let bgm_url = find_bgm_asset(assets_store);
     let client_cfg_json = serde_json::json!({
         "title": config.window.title,
         "notice_url": config.server.notice_url,
         "is_admin": is_admin,
         "bgm_url": bgm_url,
     });
+    let safe_cfg_json = escape_js_line_separators(client_cfg_json.to_string());
     let init_script = format!(
         "{}\nwindow.PatcherAPI.config = {};",
-        JS_BRIDGE_SCRIPT, client_cfg_json
+        JS_BRIDGE_SCRIPT, safe_cfg_json
     );
 
     let mut webview_builder = WebViewBuilder::new_with_web_context(&mut web_context)
@@ -835,8 +864,12 @@ fn main() -> anyhow::Result<()> {
                     start_patcher_task(engine_for_ipc.clone(), proxy_for_ipc.clone(), is_patching_ipc.clone());
                 }
                 IpcAction::ForceRepatch => {
-                    let _ = engine_for_ipc.reset_cache();
-                    start_patcher_task(engine_for_ipc.clone(), proxy_for_ipc.clone(), is_patching_ipc.clone());
+                    if !is_patching_ipc.load(Ordering::SeqCst) {
+                        let _ = engine_for_ipc.reset_cache();
+                        start_patcher_task(engine_for_ipc.clone(), proxy_for_ipc.clone(), is_patching_ipc.clone());
+                    } else {
+                        log::warn!("Ignoring force_repatch while patching is in progress.");
+                    }
                 }
             }
         }
@@ -850,17 +883,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 7. Tao Event Loop Handling
+    let engine_for_loop = engine.clone();
     event_loop.run(move |event, _, control_flow| {
         let _keep_context_alive = &web_context;
         *control_flow = ControlFlow::Wait;
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                engine_for_loop.cancel();
                 *control_flow = ControlFlow::Exit;
                 std::process::exit(0);
             }
             Event::UserEvent(user_event) => match user_event {
                 UserEvent::CloseWindow => {
+                    engine_for_loop.cancel();
                     *control_flow = ControlFlow::Exit;
                     std::process::exit(0);
                 }
@@ -931,44 +967,57 @@ fn start_patcher_task(
     });
 }
 
-fn dispatch_status_to_webview(webview: &WebView, status: &EngineStatus) {
-    let script = match status {
-        EngineStatus::Idle => {
-            r#"if (window.PatcherAPI && window.PatcherAPI._notify) { window.PatcherAPI._notify("idle", {}); }"#.to_string()
-        }
-        EngineStatus::CheckingForUpdates => {
-            r#"if (window.PatcherAPI && window.PatcherAPI._notify) { window.PatcherAPI._notify("checking", {}); }"#.to_string()
-        }
-        EngineStatus::Downloading(prog) => {
-            let speed_str = format_speed(prog.bytes_per_sec);
-            let escaped_file = prog.current_file.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(
-                r#"if (window.PatcherAPI && window.PatcherAPI._notify) {{ window.PatcherAPI._notify("downloading", {{ current: {}, total: {}, speed: "{}", current_file: "{}" }}); }}"#,
-                prog.downloaded_files, prog.total_files, speed_str, escaped_file
-            )
-        }
-        EngineStatus::Installing(inst) => {
-            let escaped_file = inst.current_patch_name.replace('\\', "\\\\").replace('"', "\\\"");
-            format!(
-                r#"if (window.PatcherAPI && window.PatcherAPI._notify) {{ window.PatcherAPI._notify("installing", {{ current: {}, total: {}, file: "{}" }}); }}"#,
-                inst.installed_patches, inst.total_patches, escaped_file
-            )
-        }
-        EngineStatus::UpToDate => {
-            r#"if (window.PatcherAPI && window.PatcherAPI._notify) { window.PatcherAPI._notify("up_to_date", {}); }"#.to_string()
-        }
-        EngineStatus::SelfUpdated => {
-            r#"if (window.PatcherAPI && window.PatcherAPI._notify) { window.PatcherAPI._notify("self_updated", {}); }"#.to_string()
-        }
-        EngineStatus::Error(err) => {
-            let escaped = err.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
-            format!(
-                r#"if (window.PatcherAPI && window.PatcherAPI._notify) {{ window.PatcherAPI._notify("error", {{ error: "{}" }}); }}"#,
-                escaped
-            )
-        }
+fn escape_js_line_separators(json: String) -> String {
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+fn build_status_dispatch_script(status: &EngineStatus) -> String {
+    let (status_name, payload) = match status {
+        EngineStatus::Idle => ("idle", serde_json::json!({})),
+        EngineStatus::CheckingForUpdates => ("checking", serde_json::json!({})),
+        EngineStatus::Downloading(prog) => (
+            "downloading",
+            serde_json::json!({
+                "current": prog.downloaded_files,
+                "total": prog.total_files,
+                "speed": format_speed(prog.bytes_per_sec),
+                "current_file": prog.current_file,
+            }),
+        ),
+        EngineStatus::Installing(inst) => (
+            "installing",
+            serde_json::json!({
+                "current": inst.installed_patches,
+                "total": inst.total_patches,
+                "file": inst.current_patch_name,
+            }),
+        ),
+        EngineStatus::UpToDate => ("up_to_date", serde_json::json!({})),
+        EngineStatus::SelfUpdated => ("self_updated", serde_json::json!({})),
+        EngineStatus::Error(err) => (
+            "error",
+            serde_json::json!({
+                "error": err,
+            }),
+        ),
     };
 
+    let status_json = escape_js_line_separators(
+        serde_json::to_string(status_name).unwrap_or_else(|_| "\"error\"".to_string()),
+    );
+    let payload_json = escape_js_line_separators(
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
+    );
+
+    format!(
+        "if (window.PatcherAPI && window.PatcherAPI._notify) {{ window.PatcherAPI._notify({}, {}); }}",
+        status_json, payload_json
+    )
+}
+
+fn dispatch_status_to_webview(webview: &WebView, status: &EngineStatus) {
+    let script = build_status_dispatch_script(status);
     let _ = webview.evaluate_script(&script);
 }
 
@@ -982,14 +1031,32 @@ fn format_speed(bps: u64) -> String {
     }
 }
 
-/// Returns true if `url` belongs to the embedded `patcher://` custom protocol or a safe local resource URL.
+fn compute_webview_data_dir(config: &PatcherConfig, _game_dir: &Path) -> PathBuf {
+    let first_plist = config
+        .server
+        .patch_servers
+        .first()
+        .map(|s| s.plist_url.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("template");
+    let seed = format!("{}\0{}", config.window.title.trim(), first_plist);
+    let digest = compute_sha256(seed.as_bytes());
+    let profile_id: String = digest[..6].iter().map(|b| format!("{:02x}", b)).collect();
+
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ModernROPatcher")
+        .join("WebView2")
+        .join(profile_id)
+}
+
+/// Returns true if `url` belongs to the embedded `patcher://` custom protocol or `about:blank`.
 fn is_internal_patcher_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     if lower.starts_with("patcher://")
         || lower == "about:blank"
         || lower.starts_with("about:blank#")
-        || lower.starts_with("data:")
-        || lower.starts_with("blob:")
     {
         return true;
     }
@@ -1026,36 +1093,51 @@ fn try_open_external(url: &str) {
     }
 }
 
-/// Finds `assets/bgm.mp3` inside embedded assets (case-insensitive) and returns its canonical relative URL.
-fn find_bgm_asset(assets: &HashMap<String, (Vec<u8>, String)>) -> Option<String> {
-    if assets.contains_key("assets/bgm.mp3") {
+fn is_blocked_asset_path(raw_trimmed: &str, lookup_key: &str) -> bool {
+    raw_trimmed.eq_ignore_ascii_case("config.json")
+        || lookup_key.eq_ignore_ascii_case("config.json")
+}
+
+/// Finds `assets/bgm.mp3` inside embedded assets (case-insensitive, O(1)) and returns its canonical relative URL.
+fn find_bgm_asset(store: &AssetStore) -> Option<String> {
+    if store.files.contains_key("assets/bgm.mp3") {
         return Some("assets/bgm.mp3".to_string());
     }
-    assets
-        .keys()
-        .find(|k| k.replace('\\', "/").eq_ignore_ascii_case("assets/bgm.mp3"))
+    store
+        .lower_index
+        .get("assets/bgm.mp3")
         .map(|k| k.replace('\\', "/"))
 }
 
-/// Looks up an embedded asset by exact path first, then normalized path, then case-insensitive match.
+/// Looks up an embedded asset by exact path first, then O(1) case-insensitive index.
 fn find_embedded_asset<'a>(
-    assets: &'a HashMap<String, (Vec<u8>, String)>,
+    store: &'a AssetStore,
     raw_trimmed: &str,
     lookup_key: &str,
 ) -> Option<&'a (Vec<u8>, String)> {
+    if is_blocked_asset_path(raw_trimmed, lookup_key) {
+        return None;
+    }
     if !raw_trimmed.is_empty() {
-        if let Some(hit) = assets.get(raw_trimmed).or_else(|| assets.get(lookup_key)) {
+        if let Some(hit) = store
+            .files
+            .get(raw_trimmed)
+            .or_else(|| store.files.get(lookup_key))
+        {
             return Some(hit);
         }
-        return assets.iter().find_map(|(k, v)| {
-            if k.eq_ignore_ascii_case(raw_trimmed) || k.eq_ignore_ascii_case(lookup_key) {
-                Some(v)
-            } else {
-                None
-            }
-        });
+        let raw_lower = raw_trimmed.replace('\\', "/").to_ascii_lowercase();
+        let key_lower = lookup_key.replace('\\', "/").to_ascii_lowercase();
+        if let Some(orig) = store
+            .lower_index
+            .get(&raw_lower)
+            .or_else(|| store.lower_index.get(&key_lower))
+        {
+            return store.files.get(orig);
+        }
+        return None;
     }
-    assets.get(lookup_key)
+    store.files.get(lookup_key)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1105,12 +1187,12 @@ fn parse_byte_range(range_header: &str, total_len: usize) -> Option<ParsedRange>
     Some(ParsedRange::Valid(start, end))
 }
 
-/// Builds a 200 OK or 206 Partial Content HTTP response for embedded assets (important for WebView2 `<audio>` streaming).
-fn build_asset_response(
-    bytes: &[u8],
+/// Builds a zero-copy 200 OK or 206 Partial Content HTTP response for embedded assets.
+fn build_asset_response<'a>(
+    bytes: &'a [u8],
     mime: &str,
     range_header: Option<&str>,
-) -> Response<Cow<'static, [u8]>> {
+) -> Response<Cow<'a, [u8]>> {
     let total_len = bytes.len();
 
     if let Some(range_val) = range_header {
@@ -1124,7 +1206,8 @@ fn build_asset_response(
                     .header("Accept-Ranges", "bytes")
                     .header("Content-Range", content_range)
                     .header("Content-Length", slice.len())
-                    .body(Cow::Owned(slice.to_vec()))
+                    .header("X-Content-Type-Options", "nosniff")
+                    .body(Cow::Borrowed(slice))
                     .unwrap_or_else(|_| {
                         Response::builder()
                             .status(500)
@@ -1136,6 +1219,7 @@ fn build_asset_response(
                 return Response::builder()
                     .status(416)
                     .header("Content-Range", format!("bytes */{}", total_len))
+                    .header("X-Content-Type-Options", "nosniff")
                     .body(Cow::Borrowed(b"Range Not Satisfiable".as_slice()))
                     .unwrap();
             }
@@ -1150,7 +1234,8 @@ fn build_asset_response(
         .header("Content-Type", mime)
         .header("Accept-Ranges", "bytes")
         .header("Content-Length", total_len)
-        .body(Cow::Owned(bytes.to_vec()))
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Cow::Borrowed(bytes))
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(500)
@@ -1170,6 +1255,10 @@ mod tests {
         assert!(is_internal_patcher_url("https://patcher.assets/index.html#"));
         assert!(is_internal_patcher_url("http://patcher.localhost/style.css"));
         assert!(is_internal_patcher_url("about:blank"));
+
+        // data: and blob: must NOT be allowed as top-level internal navigation targets
+        assert!(!is_internal_patcher_url("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_internal_patcher_url("blob:http://patcher.assets/123"));
 
         assert!(!is_external_http_url("http://patcher.assets/index.html"));
         assert!(!is_external_http_url("patcher://assets/index.html"));
@@ -1193,25 +1282,56 @@ mod tests {
 
     #[test]
     fn test_find_bgm_asset_case_insensitive_and_optional() {
-        let mut assets = HashMap::new();
-        assets.insert("index.html".to_string(), (b"<html></html>".to_vec(), "text/html".to_string()));
-        assert_eq!(find_bgm_asset(&assets), None);
+        let mut raw = HashMap::new();
+        raw.insert("index.html".to_string(), (b"<html></html>".to_vec(), "text/html".to_string()));
+        raw.insert("config.json".to_string(), (b"{}".to_vec(), "application/json".to_string()));
+        let store_empty = AssetStore::new(raw.clone());
+        assert_eq!(find_bgm_asset(&store_empty), None);
+        assert!(find_embedded_asset(&store_empty, "config.json", "config.json").is_none());
+        assert!(find_embedded_asset(&store_empty, "CONFIG.JSON", "CONFIG.JSON").is_none());
 
-        assets.insert("assets/BGM.MP3".to_string(), (vec![1, 2, 3], "audio/mpeg".to_string()));
-        assert_eq!(find_bgm_asset(&assets).as_deref(), Some("assets/BGM.MP3"));
+        raw.insert("assets/BGM.MP3".to_string(), (vec![1, 2, 3], "audio/mpeg".to_string()));
+        let store = AssetStore::new(raw);
+        assert_eq!(find_bgm_asset(&store).as_deref(), Some("assets/BGM.MP3"));
 
-        let hit = find_embedded_asset(&assets, "assets/bgm.mp3", "bgm.mp3");
+        let hit = find_embedded_asset(&store, "assets/bgm.mp3", "bgm.mp3");
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().0, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_build_status_dispatch_script_prevents_js_injection() {
+        let hostile = "\"); alert(1); //\n\r\u{2028}\u{2029}\\'";
+        let err_script = build_status_dispatch_script(&EngineStatus::Error(hostile.to_string()));
+        assert!(!err_script.contains('\n'));
+        assert!(!err_script.contains('\r'));
+        assert!(!err_script.contains('\u{2028}'));
+        assert!(!err_script.contains('\u{2029}'));
+        assert!(err_script.contains(r#"\"); alert(1); //"#));
+        assert!(err_script.contains(r#"\u2028"#));
+        assert!(err_script.contains(r#"\u2029"#));
+
+        let dl_script = build_status_dispatch_script(&EngineStatus::Downloading(
+            patcher_core::downloader::DownloadProgress {
+                downloaded_files: 1,
+                total_files: 2,
+                bytes_per_sec: 1024,
+                current_file: hostile.to_string(),
+            },
+        ));
+        assert!(!dl_script.contains('\n'));
+        assert!(dl_script.contains(r#"\"); alert(1); //"#));
     }
 
     #[test]
     fn test_parse_byte_range_and_build_asset_response() {
         let data: Vec<u8> = (0..100).collect();
 
-        // Full 200 response
+        // Full 200 response (zero-copy Cow::Borrowed + nosniff)
         let full = build_asset_response(&data, "audio/mpeg", None);
         assert_eq!(full.status().as_u16(), 200);
+        assert!(matches!(full.body(), Cow::Borrowed(_)));
+        assert_eq!(full.headers().get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(full.headers().get("accept-ranges").unwrap(), "bytes");
         assert_eq!(full.headers().get("content-length").unwrap(), "100");
         assert_eq!(full.body().len(), 100);
@@ -1219,12 +1339,15 @@ mod tests {
         // Open-ended range `bytes=0-`
         let open = build_asset_response(&data, "audio/mpeg", Some("bytes=0-"));
         assert_eq!(open.status().as_u16(), 206);
+        assert!(matches!(open.body(), Cow::Borrowed(_)));
         assert_eq!(open.headers().get("content-range").unwrap(), "bytes 0-99/100");
         assert_eq!(open.body().len(), 100);
 
         // Closed subrange `bytes=10-19`
         let partial = build_asset_response(&data, "audio/mpeg", Some("bytes=10-19"));
         assert_eq!(partial.status().as_u16(), 206);
+        assert!(matches!(partial.body(), Cow::Borrowed(_)));
+        assert_eq!(partial.headers().get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(partial.headers().get("content-range").unwrap(), "bytes 10-19/100");
         assert_eq!(partial.headers().get("content-length").unwrap(), "10");
         assert_eq!(partial.body().as_ref(), &(10..20).collect::<Vec<u8>>()[..]);

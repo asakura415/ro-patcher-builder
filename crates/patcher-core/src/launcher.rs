@@ -1,6 +1,30 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use anyhow::{bail, Context, Result};
+
+fn resolve_contained_executable(exe: &Path, working_dir: &Path) -> Result<PathBuf> {
+    if exe.is_absolute() {
+        if !exe.exists() {
+            bail!("Executable not found at {:?}", exe);
+        }
+        let canon_dir = std::fs::canonicalize(working_dir)
+            .with_context(|| format!("Failed to canonicalize working directory {:?}", working_dir))?;
+        let canon_exe = std::fs::canonicalize(exe)
+            .with_context(|| format!("Failed to canonicalize executable {:?}", exe))?;
+        if !canon_exe.starts_with(&canon_dir) {
+            bail!(
+                "Executable {:?} escapes working directory {:?}",
+                exe,
+                working_dir
+            );
+        }
+        Ok(canon_exe)
+    } else {
+        let rel_str = exe.to_string_lossy();
+        crate::patching::resolve_safe_relative_path(working_dir, &rel_str)
+            .with_context(|| format!("Unsafe executable path {:?}", exe))
+    }
+}
 
 pub fn launch_game(
     executable_path: impl AsRef<Path>,
@@ -10,11 +34,7 @@ pub fn launch_game(
     let exe = executable_path.as_ref();
     let dir = working_dir.as_ref();
 
-    let full_exe = if exe.is_absolute() {
-        exe.to_path_buf()
-    } else {
-        dir.join(exe)
-    };
+    let full_exe = resolve_contained_executable(exe, dir)?;
 
     if !full_exe.exists() {
         bail!("Client executable not found at {:?}", full_exe);
@@ -55,7 +75,7 @@ pub fn launch_setup(
     working_dir: impl AsRef<Path>,
 ) -> Result<()> {
     let dir = working_dir.as_ref();
-    let full_exe = dir.join(setup_executable);
+    let full_exe = resolve_contained_executable(Path::new(setup_executable), dir)?;
 
     if !full_exe.exists() {
         bail!("Setup executable not found at {:?}", full_exe);
@@ -177,20 +197,31 @@ pub fn validate_external_url(url: &str) -> Result<&str> {
     if trimmed.is_empty() {
         bail!("External URL cannot be empty");
     }
-    if trimmed.chars().any(|c| c.is_control()) {
-        bail!("External URL contains invalid control characters");
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("External URL contains invalid control or whitespace characters");
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\'))
+    {
+        bail!("External URL contains disallowed characters: {:?}", trimmed);
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    let after_scheme = if let Some(rest) = lower.strip_prefix("https://") {
-        rest
-    } else if let Some(rest) = lower.strip_prefix("http://") {
-        rest
-    } else {
-        bail!("Only http:// and https:// URLs are allowed: {:?}", trimmed);
-    };
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    match after_scheme {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => bail!("External URL must be http(s):// with a valid host: {:?}", trimmed),
+    }
 
-    if after_scheme.is_empty() || after_scheme.starts_with('/') {
+    let parsed = url::Url::parse(trimmed)
+        .with_context(|| format!("Invalid external URL: {:?}", trimmed))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("Only http:// and https:// URLs are allowed: {:?}", trimmed);
+    }
+    if parsed.host_str().map_or(true, |h| h.is_empty()) {
         bail!("External URL is missing a valid host: {:?}", trimmed);
     }
 
@@ -294,6 +325,10 @@ mod tests {
             "https://",
             "http:///path",
             "https://example.com\nfoo",
+            "https://example.com/a b",
+            "https://example.com/\"quote\"",
+            "https://example.com/'sq'",
+            "https://example.com/a\\b",
         ] {
             assert!(
                 validate_external_url(bad).is_err(),
@@ -306,5 +341,21 @@ mod tests {
                 bad
             );
         }
+    }
+
+    #[test]
+    fn test_launch_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path();
+
+        // Traversal relative path rejected
+        assert!(launch_game("..\\..\\Windows\\System32\\cmd.exe", &[], game_dir).is_err());
+        assert!(launch_setup("..\\evil.exe", game_dir).is_err());
+
+        // Absolute path outside game_dir rejected
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_exe = outside_dir.path().join("outside.exe");
+        std::fs::write(&outside_exe, b"MZ").unwrap();
+        assert!(launch_game(&outside_exe, &[], game_dir).is_err());
     }
 }

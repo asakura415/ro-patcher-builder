@@ -1,7 +1,9 @@
 use std::path::Path;
 use patcher_core::config::{PatcherConfig, PatchServerInfo};
 use patcher_core::overlay::{append_overlay_to_file, create_overlay_zip};
-use patcher_core::pe::update_executable_icon;
+use patcher_core::pe::{
+    update_executable_resources, PeVersionInfo, DEFAULT_AS_INVOKER_MANIFEST,
+};
 
 fn main() -> anyhow::Result<()> {
     let base_template = Path::new("template-dist/patcher_base.exe");
@@ -15,13 +17,6 @@ fn main() -> anyhow::Result<()> {
 
     println!("Copying base template {:?} to {:?}", base_template, output_exe);
     std::fs::copy(base_template, output_exe)?;
-
-    if icon_path.exists() {
-        println!("Updating PE icon from {:?}", icon_path);
-        if let Err(e) = update_executable_icon(output_exe, icon_path) {
-            eprintln!("Warning: could not update icon: {}", e);
-        }
-    }
 
     let mut config = PatcherConfig::default();
     config.server.patch_servers.push(PatchServerInfo {
@@ -39,6 +34,28 @@ fn main() -> anyhow::Result<()> {
     config.window.width = 820;
     config.window.height = 540;
     config.window.transparent = true;
+
+    let version_info = PeVersionInfo::from_title_and_filename(
+        &config.window.title,
+        output_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("_PRONTERA BOX - Patcher.exe"),
+    );
+    let ico_opt = if icon_path.exists() {
+        Some(icon_path)
+    } else {
+        None
+    };
+    println!("Updating PE resources (icon + version info + manifest)...");
+    if let Err(e) = update_executable_resources(
+        output_exe,
+        ico_opt,
+        Some(&version_info),
+        Some(DEFAULT_AS_INVOKER_MANIFEST),
+    ) {
+        eprintln!("Warning: could not update PE resources: {:#}", e);
+    }
 
     println!("Creating overlay ZIP from {:?}", theme_dir);
     let payload = create_overlay_zip(&config, theme_dir)?;

@@ -1,7 +1,7 @@
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::archive::{serialize_as_win1252_str_into, serialize_to_win1252, GenericFileEntry};
 use crate::thor::{
@@ -105,8 +105,7 @@ impl<W: Write + Seek> ThorArchiveBuilder<W> {
         let compressed_data_size = compressed_data.len();
 
         let offset = self.obj.seek(SeekFrom::Current(0))?;
-        let mut compressed_reader = Cursor::new(compressed_data);
-        let _ = io::copy(&mut compressed_reader, self.obj.by_ref())?;
+        self.obj.write_all(&compressed_data)?;
         self.entries.insert(
             entry_path,
             Some(BuilderFileEntry {
@@ -149,7 +148,7 @@ impl<W: Write + Seek> ThorArchiveBuilder<W> {
     }
 
     fn write_file_table(&mut self) -> Result<(u64, usize)> {
-        let mut table: Vec<u8> = Vec::new();
+        let mut table: Vec<u8> = Vec::with_capacity(self.entries.len().saturating_mul(48));
         // Generate table and write files' content
         for (relative_path, entry) in &self.entries {
             let mut rel_path_win1252 = Vec::with_capacity(relative_path.len());

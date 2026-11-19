@@ -76,41 +76,52 @@ document.addEventListener("DOMContentLoaded", async function() {
         mirrors.forEach((m, idx) => {
             const div = document.createElement("div");
             div.className = "mirror-item";
-            div.innerHTML = `
-                <input type="text" placeholder="Mirror Name" value="${m.name}" data-idx="${idx}" class="mirror-name">
-                <input type="text" placeholder="plist.txt URL" value="${m.plist_url}" data-idx="${idx}" class="mirror-plist">
-                <input type="text" placeholder="Patch URL Directory" value="${m.patch_url}" data-idx="${idx}" class="mirror-patch">
-                <button class="btn btn-outline btn-sm remove-mirror" data-idx="${idx}">&times;</button>
-            `;
-            mirrorList.appendChild(div);
-        });
 
-        // Add listeners
-        document.querySelectorAll(".remove-mirror").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                const idx = parseInt(e.target.getAttribute("data-idx"));
+            const nameInput = document.createElement("input");
+            nameInput.type = "text";
+            nameInput.placeholder = "Mirror Name";
+            nameInput.value = m.name || "";
+            nameInput.dataset.idx = String(idx);
+            nameInput.className = "mirror-name";
+            nameInput.addEventListener("input", (e) => {
+                mirrors[idx].name = e.target.value;
+            });
+
+            const plistInput = document.createElement("input");
+            plistInput.type = "text";
+            plistInput.placeholder = "plist.txt URL";
+            plistInput.value = m.plist_url || "";
+            plistInput.dataset.idx = String(idx);
+            plistInput.className = "mirror-plist";
+            plistInput.addEventListener("input", (e) => {
+                mirrors[idx].plist_url = e.target.value;
+            });
+
+            const patchInput = document.createElement("input");
+            patchInput.type = "text";
+            patchInput.placeholder = "Patch URL Directory";
+            patchInput.value = m.patch_url || "";
+            patchInput.dataset.idx = String(idx);
+            patchInput.className = "mirror-patch";
+            patchInput.addEventListener("input", (e) => {
+                mirrors[idx].patch_url = e.target.value;
+            });
+
+            const removeBtn = document.createElement("button");
+            removeBtn.type = "button";
+            removeBtn.className = "btn btn-outline btn-sm remove-mirror";
+            removeBtn.dataset.idx = String(idx);
+            removeBtn.textContent = "\u00D7";
+            removeBtn.addEventListener("click", () => {
                 mirrors.splice(idx, 1);
                 renderMirrors();
             });
-        });
 
-        document.querySelectorAll(".mirror-name").forEach(input => {
-            input.addEventListener("input", (e) => {
-                const idx = parseInt(e.target.getAttribute("data-idx"));
-                mirrors[idx].name = e.target.value;
-            });
-        });
-        document.querySelectorAll(".mirror-plist").forEach(input => {
-            input.addEventListener("input", (e) => {
-                const idx = parseInt(e.target.getAttribute("data-idx"));
-                mirrors[idx].plist_url = e.target.value;
-            });
-        });
-        document.querySelectorAll(".mirror-patch").forEach(input => {
-            input.addEventListener("input", (e) => {
-                const idx = parseInt(e.target.getAttribute("data-idx"));
-                mirrors[idx].patch_url = e.target.value;
-            });
+            div.appendChild(nameInput);
+            div.appendChild(plistInput);
+            div.appendChild(patchInput);
+            div.appendChild(removeBtn);
+            mirrorList.appendChild(div);
         });
     }
 
@@ -185,12 +196,23 @@ document.addEventListener("DOMContentLoaded", async function() {
         try {
             const res = await invoke("scan_game_directory", { dirPath: path });
             scanResults.style.display = "block";
-            let html = `<strong>Scan Results in ${path}:</strong><br>`;
-            html += `&#127918; Client Executable: <b>${res.found_clients.join(", ") || "None"}</b><br>`;
-            html += `&#9881; Settings Executable: <b>${res.found_settings.join(", ") || "None"}</b><br>`;
-            html += `&#128230; GRF Archives: <b>${res.found_grfs.join(", ") || "None"}</b><br>`;
-            html += `&#127912; Icons: <b>${res.found_icons.join(", ") || "None"}</b><br>`;
-            scanResults.innerHTML = html;
+            scanResults.textContent = "";
+            const headerEl = document.createElement("strong");
+            headerEl.textContent = `Scan Results in ${path}:`;
+            scanResults.appendChild(headerEl);
+            scanResults.appendChild(document.createElement("br"));
+
+            const appendScanRow = (prefix, items) => {
+                scanResults.appendChild(document.createTextNode(prefix));
+                const bold = document.createElement("b");
+                bold.textContent = items.length > 0 ? items.join(", ") : "None";
+                scanResults.appendChild(bold);
+                scanResults.appendChild(document.createElement("br"));
+            };
+            appendScanRow("\uD83C\uDFAE Client Executable: ", res.found_clients);
+            appendScanRow("\u2699 Settings Executable: ", res.found_settings);
+            appendScanRow("\uD83D\uDCE6 GRF Archives: ", res.found_grfs);
+            appendScanRow("\uD83C\uDFA8 Icons: ", res.found_icons);
 
             // Auto-fill form fields
             if (res.found_clients.length > 0) {
@@ -466,7 +488,15 @@ document.addEventListener("DOMContentLoaded", async function() {
             makerStatusMsg.innerText = e;
         } finally {
             const labelText = window.I18N ? I18N.t("btnBuildThor") : "Generate THOR Patch (.thor)";
-            btnBuildThor.innerHTML = `<span>&#128230;</span> <span data-i18n="btnBuildThor">${labelText}</span>`;
+            btnBuildThor.textContent = "";
+            const iconSpan = document.createElement("span");
+            iconSpan.textContent = "\uD83D\uDCE6";
+            const labelSpan = document.createElement("span");
+            labelSpan.setAttribute("data-i18n", "btnBuildThor");
+            labelSpan.textContent = labelText;
+            btnBuildThor.appendChild(iconSpan);
+            btnBuildThor.appendChild(document.createTextNode(" "));
+            btnBuildThor.appendChild(labelSpan);
             btnBuildThor.disabled = false;
         }
     });

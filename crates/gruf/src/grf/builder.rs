@@ -2,7 +2,7 @@ use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::archive::{serialize_as_win1252_cstr_into, GenericFileEntry};
@@ -85,9 +85,8 @@ impl<W: Write + Seek> GrfArchiveBuilder<W> {
         };
 
         self.obj.seek(SeekFrom::Start(self.start_offset + offset))?;
-        let mut content_reader = Cursor::new(content);
-        let content_size = io::copy(&mut content_reader, self.obj.by_ref())?;
-        debug_assert_eq!(entry.size_compressed_aligned as u64, content_size);
+        debug_assert_eq!(entry.size_compressed_aligned, content.len());
+        self.obj.write_all(&content)?;
         self.entries.insert(
             relative_path,
             GenericFileEntry {
@@ -122,8 +121,7 @@ impl<W: Write + Seek> GrfArchiveBuilder<W> {
         };
 
         self.obj.seek(SeekFrom::Start(self.start_offset + offset))?;
-        let mut content_reader = Cursor::new(content);
-        let _ = io::copy(&mut content_reader, self.obj.by_ref())?;
+        self.obj.write_all(&content)?;
         self.entries.insert(
             relative_path,
             GenericFileEntry {
@@ -156,8 +154,7 @@ impl<W: Write + Seek> GrfArchiveBuilder<W> {
         };
 
         self.obj.seek(SeekFrom::Start(self.start_offset + offset))?;
-        let mut compressed_reader = Cursor::new(compressed_data);
-        let _ = io::copy(&mut compressed_reader, self.obj.by_ref())?;
+        self.obj.write_all(&compressed_data)?;
         let compressed_data_size_u32 = u32::try_from(compressed_data_size)?;
         self.entries.insert(
             relative_path,
@@ -203,7 +200,7 @@ impl<W: Write + Seek> GrfArchiveBuilder<W> {
     }
 
     fn write_grf_table_200(&mut self) -> Result<u64> {
-        let mut table: Vec<u8> = Vec::new();
+        let mut table: Vec<u8> = Vec::with_capacity(self.entries.len().saturating_mul(48));
         // Generate table and write files' content
         for (relative_path, entry) in &self.entries {
             let grf_file_entry = SerializableGrfFileEntry200 {

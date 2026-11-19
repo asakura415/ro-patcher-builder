@@ -4,13 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark light">
-    <script>
-        try {
-            const saved = localStorage.getItem("color-scheme") || "dark";
-            document.querySelector('meta[name="color-scheme"]').content = saved;
-            document.documentElement.setAttribute('data-theme', saved);
-        } catch (e) {}
-    </script>
+    <script src="theme-init.js"></script>
     <title>Modern RO Patcher Builder</title>
     <link rel="stylesheet" href="style.css">
     <script src="i18n.js"></script>

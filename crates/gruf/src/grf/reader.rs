@@ -1,6 +1,6 @@
 use std::boxed::Box;
 use std::collections::HashMap;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
@@ -21,6 +21,11 @@ pub const GRF_HEADER_MAGIC: &str = "Master of Magic\0";
 pub const GRF_HEADER_SIZE: usize = GRF_HEADER_MAGIC.len() + 0x1E;
 const GRF_TABLE_INFO2_SIZE: usize = 2 * std::mem::size_of::<u32>();
 
+// Defensive bounds for untrusted GRF headers/tables/entries
+const MAX_GRF_TABLE_COMPRESSED_SIZE: usize = 128 * 1024 * 1024;
+const MAX_GRF_TABLE_DECOMPRESSED_SIZE: usize = 512 * 1024 * 1024;
+const MAX_GRF_ENTRY_SIZE: usize = 512 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct GrfArchive {
     obj: Box<File>,
@@ -31,6 +36,7 @@ impl GrfArchive {
     /// Create a new archive with the underlying object as the reader.
     pub fn open<P: AsRef<Path>>(grf_path: P) -> Result<Self> {
         let mut file = File::open(grf_path)?;
+        let file_len = file.metadata()?.len();
         let mut grf_header_buf = [0; GRF_HEADER_SIZE];
         file.read_exact(&mut grf_header_buf)?;
         let (parser_output, grf_header) = parse_grf_header(&grf_header_buf)
@@ -38,16 +44,29 @@ impl GrfArchive {
 
         match grf_header.version_major {
             2 => {
+                let table_pos = (GRF_HEADER_SIZE as u64)
+                    .checked_add(grf_header.file_table_offset)
+                    .ok_or_else(|| GrufError::parsing_error("GRF table offset overflow"))?;
+                let table_data_start = table_pos
+                    .checked_add(GRF_TABLE_INFO2_SIZE as u64)
+                    .ok_or_else(|| GrufError::parsing_error("GRF table info offset overflow"))?;
+                if table_data_start > file_len {
+                    return Err(GrufError::parsing_error(
+                        "GRF file table info extends past EOF",
+                    ));
+                }
+
                 let mut table_info_buf = [0; GRF_TABLE_INFO2_SIZE];
-                file.seek(SeekFrom::Start(
-                    GRF_HEADER_SIZE as u64 + grf_header.file_table_offset,
-                ))?;
+                file.seek(SeekFrom::Start(table_pos))?;
                 file.read_exact(&mut table_info_buf)?;
                 let (_parser_output, grf_table_info) = parse_grf_table_info_200(&table_info_buf)
                     .map_err(|_| {
                         GrufError::parsing_error("Failed to parse archive (table info)")
                     })?;
-                if grf_table_info.table_size_compressed == 0 || grf_table_info.table_size == 0 {
+                if grf_table_info.table_size_compressed == 0
+                    || grf_table_info.table_size == 0
+                    || grf_header.file_count == 0
+                {
                     return Ok(Self {
                         obj: Box::new(file),
                         container: GrfContainer {
@@ -57,17 +76,36 @@ impl GrfArchive {
                         },
                     });
                 }
-                // Decompress the table with zlib
-                let mut compressed_table: Vec<u8> =
-                    Vec::with_capacity(grf_table_info.table_size_compressed);
-                let mut file_chunk = file.by_ref().take(compressed_table.capacity() as u64);
-                file_chunk.read_to_end(&mut compressed_table)?;
-                let mut decoder = ZlibDecoder::new(compressed_table.as_slice());
-                let mut decompressed_table = vec![];
-                let _decompressed_size =
-                    decoder.read_to_end(&mut decompressed_table).map_err(|e| {
+                if grf_table_info.table_size_compressed > MAX_GRF_TABLE_COMPRESSED_SIZE {
+                    return Err(GrufError::parsing_error(
+                        "GRF compressed file table exceeds maximum allowed size",
+                    ));
+                }
+                let table_end = table_data_start
+                    .checked_add(grf_table_info.table_size_compressed as u64)
+                    .ok_or_else(|| GrufError::parsing_error("GRF table size overflow"))?;
+                if table_end > file_len {
+                    return Err(GrufError::parsing_error(
+                        "GRF compressed file table extends past EOF",
+                    ));
+                }
+
+                // Decompress the table with zlib (bounded)
+                let mut compressed_table = vec![0u8; grf_table_info.table_size_compressed];
+                file.read_exact(&mut compressed_table)?;
+                let decoder = ZlibDecoder::new(compressed_table.as_slice());
+                let mut decompressed_table = Vec::new();
+                let decompressed_size = decoder
+                    .take(MAX_GRF_TABLE_DECOMPRESSED_SIZE as u64 + 1)
+                    .read_to_end(&mut decompressed_table)
+                    .map_err(|e| {
                         GrufError::ParsingError(format!("Failed to decompress file table: {}", e))
                     })?;
+                if decompressed_size > MAX_GRF_TABLE_DECOMPRESSED_SIZE {
+                    return Err(GrufError::parsing_error(
+                        "GRF decompressed file table exceeds maximum allowed size",
+                    ));
+                }
                 // Parse entries
                 let (_output, entries) = parse_grf_file_entries_200(
                     decompressed_table.as_slice(),
@@ -89,7 +127,7 @@ impl GrfArchive {
                     return Err(GrufError::parsing_error("Unsupported archive version"));
                 }
                 let table_size = parser_output.len();
-                if table_size == 0 {
+                if table_size == 0 || grf_header.file_count <= 1 {
                     return Ok(Self {
                         obj: Box::new(file),
                         container: GrfContainer {
@@ -99,9 +137,17 @@ impl GrfArchive {
                         },
                     });
                 }
+                let table_offset = usize::try_from(grf_header.file_table_offset).map_err(|_| {
+                    GrufError::parsing_error("GRF 1.x table offset out of range")
+                })?;
+                if table_offset > parser_output.len() {
+                    return Err(GrufError::parsing_error(
+                        "GRF 1.x table offset extends past buffer",
+                    ));
+                }
                 // Parse entries
                 let (_parser_output, entries) = parse_grf_file_entries_101(
-                    &parser_output[grf_header.file_table_offset as usize..],
+                    &parser_output[table_offset..],
                     grf_header.file_count,
                 )
                 .map_err(|_| GrufError::parsing_error("Failed to parse file table"))?;
@@ -139,11 +185,28 @@ impl GrfArchive {
         if file_entry.size == 0 {
             return Ok(vec![]);
         }
+        if file_entry.size_compressed_aligned > MAX_GRF_ENTRY_SIZE
+            || file_entry.size > MAX_GRF_ENTRY_SIZE
+        {
+            return Err(GrufError::parsing_error(
+                "GRF entry size exceeds maximum allowed limit",
+            ));
+        }
+
+        let file_len = self.obj.metadata()?.len();
+        let entry_end = file_entry
+            .offset
+            .checked_add(file_entry.size_compressed_aligned as u64)
+            .ok_or_else(|| GrufError::parsing_error("GRF entry offset overflow"))?;
+        if entry_end > file_len {
+            return Err(GrufError::parsing_error(
+                "GRF entry extends past end of archive",
+            ));
+        }
 
         self.obj.seek(SeekFrom::Start(file_entry.offset))?;
-        let mut content: Vec<u8> = Vec::with_capacity(file_entry.size_compressed_aligned);
-        let mut file_chunk = self.obj.by_ref().take(content.capacity() as u64);
-        file_chunk.read_to_end(&mut content)?;
+        let mut content = vec![0u8; file_entry.size_compressed_aligned];
+        self.obj.read_exact(&mut content)?;
         Ok(content)
     }
 
@@ -155,21 +218,40 @@ impl GrfArchive {
         if file_entry.size == 0 {
             return Ok(vec![]);
         }
+        if file_entry.size_compressed_aligned > MAX_GRF_ENTRY_SIZE
+            || file_entry.size > MAX_GRF_ENTRY_SIZE
+        {
+            return Err(GrufError::parsing_error(
+                "GRF entry size exceeds maximum allowed limit",
+            ));
+        }
+
+        let file_len = self.obj.metadata()?.len();
+        let entry_end = file_entry
+            .offset
+            .checked_add(file_entry.size_compressed_aligned as u64)
+            .ok_or_else(|| GrufError::parsing_error("GRF entry offset overflow"))?;
+        if entry_end > file_len {
+            return Err(GrufError::parsing_error(
+                "GRF entry extends past end of archive",
+            ));
+        }
 
         self.obj.seek(SeekFrom::Start(file_entry.offset))?;
-        let mut content: Vec<u8> = Vec::with_capacity(file_entry.size_compressed_aligned);
-        let mut file_chunk = self.obj.by_ref().take(content.capacity() as u64);
-        file_chunk.read_to_end(&mut content)?;
+        let mut content = vec![0u8; file_entry.size_compressed_aligned];
+        self.obj.read_exact(&mut content)?;
         match file_entry.encryption {
             GrfFileEncryption::Unencrypted => {}
             GrfFileEncryption::Encrypted(cycle) => {
                 decrypt_file_content(&mut content, cycle);
             }
         }
-        // Decompress the content with zlib
-        let mut decoder = ZlibDecoder::new(content.as_slice());
-        let mut decompressed_content = Vec::new();
-        let decompressed_size = decoder.read_to_end(&mut decompressed_content)?;
+        // Decompress the content with zlib (bounded to declared size + 1 to detect bombs)
+        let decoder = ZlibDecoder::new(content.as_slice());
+        let mut decompressed_content = Vec::with_capacity(file_entry.size.min(16 * 1024 * 1024));
+        let decompressed_size = decoder
+            .take(file_entry.size as u64 + 1)
+            .read_to_end(&mut decompressed_content)?;
         if decompressed_size != file_entry.size {
             return Err(GrufError::parsing_error(
                 "Decompressed content is not as expected",
@@ -254,24 +336,31 @@ pub enum GrfFileEncryption {
     Encrypted(usize), // Contains the cycle as usize
 }
 
-named!(parse_grf_header<&[u8], GrfHeader>,
-    do_parse!(
-        tag!(GRF_HEADER_MAGIC)
-            >> key: take!(14)
-            >> file_table_offset: le_u32
-            >> seed: le_i32
-            >> v_files_count: le_i32
-            >> version: le_u32
-            >> (GrfHeader {
-                key: key.try_into().unwrap(),
-                file_table_offset: file_table_offset as u64,
-                seed,
-                file_count: (v_files_count - seed - 7) as usize,
-                version_major: (version >> 8) & 0xFF,
-                version_minor: version & 0xFF
-            }
-    )
-));
+fn parse_grf_header(input: &[u8]) -> IResult<&[u8], GrfHeader> {
+    let (input, _) = tag!(input, GRF_HEADER_MAGIC)?;
+    let (input, key) = take!(input, 14usize)?;
+    let (input, file_table_offset) = le_u32(input)?;
+    let (input, seed) = le_i32(input)?;
+    let (input, v_files_count) = le_i32(input)?;
+    let (input, version) = le_u32(input)?;
+    let file_count = v_files_count
+        .checked_sub(seed)
+        .and_then(|v| v.checked_sub(7))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| nom::Err::Failure((input, ErrorKind::Verify)))?;
+
+    Ok((
+        input,
+        GrfHeader {
+            key: key.try_into().unwrap(),
+            file_table_offset: file_table_offset as u64,
+            seed,
+            file_count,
+            version_major: (version >> 8) & 0xFF,
+            version_minor: version & 0xFF,
+        },
+    ))
+}
 
 named!(parse_grf_table_info_200<&[u8], GrfTableInfo2>,
     do_parse!(
@@ -308,56 +397,59 @@ macro_rules! take_obfuscated_name_101 (
 
 fn determine_file_encryption_101(file_name: &str, size_compressed: usize) -> GrfFileEncryption {
     const SPECIAL_EXTENSIONS: [&str; 4] = [".gnd", ".gat", ".act", ".str"];
-    let file_name_len = file_name.len();
-    if file_name_len < 4 {
-        return GrfFileEncryption::Encrypted(0);
-    }
-    let file_extension = &file_name[file_name_len - 4..];
-    match SPECIAL_EXTENSIONS.iter().position(|&r| r == file_extension) {
-        Some(_) => GrfFileEncryption::Encrypted(0),
-        None => GrfFileEncryption::Encrypted(digit_count(size_compressed)),
+    if SPECIAL_EXTENSIONS.iter().any(|ext| file_name.ends_with(ext)) {
+        GrfFileEncryption::Encrypted(0)
+    } else {
+        GrfFileEncryption::Encrypted(digit_count(size_compressed))
     }
 }
 
-/// Counts digits naively
-fn digit_count(n: usize) -> usize {
+/// Counts decimal digits without multiplication overflow
+fn digit_count(mut n: usize) -> usize {
     let mut result = 1;
-    let mut acc = 10;
-    loop {
-        if n < acc {
-            break;
-        }
-        acc *= 10;
+    while n >= 10 {
+        n /= 10;
         result += 1;
     }
-
     result
 }
 
 // Parses file table entries for GRF 1.1, 1.2 and 1.3
-named!(parse_grf_file_entry_101<&[u8], GrfFileEntry>,
-    do_parse!(
-        path_size_padded: le_u32
-            >> take!(2) // Null chars
-            >> relative_path: take_obfuscated_name_101!(path_size_padded - 6)
-            >> take!(4) // Null chars
-            >> size_tot_enc: le_u32
-            >> size_compressed_aligned_enc: le_u32
-            >> size: le_u32
-            >> entry_type: le_u8
-            >> offset: le_u32
-            >> (GrfFileEntry {
-                size_compressed: (size_tot_enc - size - 0x02CB) as usize,
-                size_compressed_aligned: (size_compressed_aligned_enc - 0x92CB) as usize,
-                size: size as usize,
-                entry_type,
-                offset: GRF_HEADER_SIZE as u64 + offset as u64,
-                encryption: determine_file_encryption_101(&relative_path, (size_tot_enc - size - 0x02CB) as usize),
-                relative_path,
-            }
-        )
-    )
-);
+fn parse_grf_file_entry_101(input: &[u8]) -> IResult<&[u8], GrfFileEntry> {
+    let (input, path_size_padded) = le_u32(input)?;
+    let path_len = path_size_padded
+        .checked_sub(6)
+        .ok_or_else(|| nom::Err::Failure((input, ErrorKind::Verify)))?;
+    let (input, _) = take!(input, 2usize)?; // Null chars
+    let (input, relative_path) = take_obfuscated_name_101!(input, path_len)?;
+    let (input, _) = take!(input, 4usize)?; // Null chars
+    let (input, size_tot_enc) = le_u32(input)?;
+    let (input, size_compressed_aligned_enc) = le_u32(input)?;
+    let (input, size) = le_u32(input)?;
+    let (input, entry_type) = le_u8(input)?;
+    let (input, offset) = le_u32(input)?;
+
+    let size_compressed = size_tot_enc
+        .checked_sub(size)
+        .and_then(|v| v.checked_sub(0x02CB))
+        .ok_or_else(|| nom::Err::Failure((input, ErrorKind::Verify)))? as usize;
+    let size_compressed_aligned = size_compressed_aligned_enc
+        .checked_sub(0x92CB)
+        .ok_or_else(|| nom::Err::Failure((input, ErrorKind::Verify)))? as usize;
+
+    Ok((
+        input,
+        GrfFileEntry {
+            size_compressed,
+            size_compressed_aligned,
+            size: size as usize,
+            entry_type,
+            offset: GRF_HEADER_SIZE as u64 + offset as u64,
+            encryption: determine_file_encryption_101(&relative_path, size_compressed),
+            relative_path,
+        },
+    ))
+}
 
 // Parses file table entries for GRF 2.0
 named!(parse_grf_file_entry_200<&[u8], GrfFileEntry>,
@@ -519,5 +611,46 @@ mod tests {
         assert_eq!(2, digit_count(99));
         assert_eq!(3, digit_count(100));
         assert_eq!(8, digit_count(87654321));
+        assert!(digit_count(usize::MAX) >= 10);
+    }
+
+    #[test]
+    fn test_grf_bounds_and_utf8_safety() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // 1. Negative file_count underflow in GRF header
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(GRF_HEADER_MAGIC.as_bytes());
+        hdr.extend_from_slice(&[0u8; 14]);
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // file_table_offset
+        hdr.extend_from_slice(&10i32.to_le_bytes()); // seed
+        hdr.extend_from_slice(&0i32.to_le_bytes()); // v_files_count (0 - 10 - 7 < 0)
+        hdr.extend_from_slice(&0x0200u32.to_le_bytes()); // version 2.0
+        assert!(parse_grf_header(&hdr).is_err());
+
+        // 2. Oversized table_size_compressed > file length
+        let mut tmp = NamedTempFile::new().unwrap();
+        let mut grf_buf = Vec::new();
+        grf_buf.extend_from_slice(GRF_HEADER_MAGIC.as_bytes());
+        grf_buf.extend_from_slice(&[0u8; 14]);
+        grf_buf.extend_from_slice(&0u32.to_le_bytes()); // file_table_offset = 0 (starts right after header)
+        grf_buf.extend_from_slice(&0i32.to_le_bytes()); // seed = 0
+        grf_buf.extend_from_slice(&8i32.to_le_bytes()); // v_files_count = 8 => 1 file
+        grf_buf.extend_from_slice(&0x0200u32.to_le_bytes()); // version 2.0
+        grf_buf.extend_from_slice(&999_999u32.to_le_bytes()); // table_size_compressed > EOF
+        grf_buf.extend_from_slice(&100u32.to_le_bytes()); // table_size
+        tmp.write_all(&grf_buf).unwrap();
+        assert!(GrfArchive::open(tmp.path()).is_err());
+
+        // 3. determine_file_encryption_101 with multi-byte UTF-8 suffix must not panic
+        assert_eq!(
+            determine_file_encryption_101("a\u{AC00}\u{B098}", 123),
+            GrfFileEncryption::Encrypted(3)
+        );
+        assert_eq!(
+            determine_file_encryption_101("map\u{AC00}.gnd", 123),
+            GrfFileEncryption::Encrypted(0)
+        );
     }
 }

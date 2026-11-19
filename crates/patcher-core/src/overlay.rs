@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -13,6 +13,9 @@ use crate::config::PatcherConfig;
 
 pub const OVERLAY_MAGIC: &[u8; 8] = b"ROPATCH1";
 pub const TRAILER_SIZE: usize = 48; // 8 bytes (size) + 32 bytes (sha256) + 8 bytes (magic)
+pub const MAX_OVERLAY_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_ASSET_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_ASSETS_SIZE: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedAssets {
@@ -51,12 +54,22 @@ pub fn read_overlay_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Option
     }
 
     let payload_size = u64::from_le_bytes(size_bytes);
-    if stream_len < (TRAILER_SIZE as u64) + payload_size {
+    if payload_size > MAX_OVERLAY_SIZE {
+        bail!(
+            "Invalid overlay: declared payload size ({} bytes) exceeds maximum limit ({} bytes).",
+            payload_size,
+            MAX_OVERLAY_SIZE
+        );
+    }
+    let total_size = (TRAILER_SIZE as u64)
+        .checked_add(payload_size)
+        .ok_or_else(|| anyhow::anyhow!("Invalid overlay: payload size overflow."))?;
+    if stream_len < total_size {
         bail!("Invalid overlay: declared payload size exceeds file size.");
     }
 
     // Seek to beginning of payload
-    let payload_offset = stream_len - (TRAILER_SIZE as u64) - payload_size;
+    let payload_offset = stream_len - total_size;
     reader.seek(SeekFrom::Start(payload_offset))?;
 
     let mut payload = vec![0u8; payload_size as usize];
@@ -134,19 +147,25 @@ pub fn create_overlay_zip(config: &PatcherConfig, web_folder: impl AsRef<Path>) 
                         continue; // Do not overwrite explicit config
                     }
 
-                    // Compressed audio files (mp3/ogg) don't benefit from deflate and stream faster Stored
+                    // Already-compressed media/fonts don't benefit from deflate and stream faster Stored
                     let lower_rel = rel_str.to_ascii_lowercase();
-                    let entry_options = if lower_rel.ends_with(".mp3") || lower_rel.ends_with(".ogg") {
+                    let entry_options = if lower_rel.ends_with(".mp3")
+                        || lower_rel.ends_with(".ogg")
+                        || lower_rel.ends_with(".jpg")
+                        || lower_rel.ends_with(".jpeg")
+                        || lower_rel.ends_with(".png")
+                        || lower_rel.ends_with(".webp")
+                        || lower_rel.ends_with(".woff2")
+                    {
                         stored_options
                     } else {
                         deflated_options
                     };
 
                     zip.start_file(&rel_str, entry_options)?;
-                    let mut file = File::open(path)?;
-                    let mut content = Vec::new();
-                    file.read_to_end(&mut content)?;
-                    zip.write_all(&content)?;
+                    let file = File::open(path)?;
+                    let mut reader = BufReader::new(file);
+                    std::io::copy(&mut reader, &mut zip)?;
                 }
             }
         }
@@ -163,6 +182,7 @@ pub fn parse_embedded_assets(payload_bytes: &[u8]) -> Result<EmbeddedAssets> {
 
     let mut config = PatcherConfig::default();
     let mut files = HashMap::new();
+    let mut total_extracted: u64 = 0;
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
@@ -171,19 +191,46 @@ pub fn parse_embedded_assets(payload_bytes: &[u8]) -> Result<EmbeddedAssets> {
             continue;
         }
 
-        let mut data = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut data)?;
+        if file.size() > MAX_ASSET_ENTRY_SIZE {
+            bail!(
+                "Embedded asset {:?} exceeds maximum allowed entry size ({} bytes).",
+                name,
+                MAX_ASSET_ENTRY_SIZE
+            );
+        }
+
+        let prealloc = file.size().min(MAX_ASSET_ENTRY_SIZE).min(16 * 1024 * 1024) as usize;
+        let mut data = Vec::with_capacity(prealloc);
+        (&mut file)
+            .take(MAX_ASSET_ENTRY_SIZE + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > MAX_ASSET_ENTRY_SIZE {
+            bail!(
+                "Embedded asset {:?} decompressed size exceeds maximum allowed limit.",
+                name
+            );
+        }
+
+        total_extracted = total_extracted
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("Embedded assets total size overflow"))?;
+        if total_extracted > MAX_TOTAL_ASSETS_SIZE {
+            bail!(
+                "Total extracted embedded assets exceed maximum allowed limit ({} bytes).",
+                MAX_TOTAL_ASSETS_SIZE
+            );
+        }
 
         if name == "config.json" {
-            if let Ok(cfg_str) = String::from_utf8(data.clone()) {
-                if let Ok(parsed_cfg) = PatcherConfig::from_json_str(&cfg_str) {
+            if let Ok(cfg_str) = std::str::from_utf8(&data) {
+                if let Ok(parsed_cfg) = PatcherConfig::from_json_str(cfg_str) {
                     config = parsed_cfg;
                 }
             }
         }
 
         let mime = guess_mime_type(&name);
-        files.insert(name.clone(), (data, mime));
+        files.insert(name, (data, mime));
     }
 
     Ok(EmbeddedAssets { config, files })
@@ -286,5 +333,38 @@ mod tests {
         let assets_without = parse_embedded_assets(&payload_without).unwrap();
         assert!(assets_without.files.contains_key("index.html"));
         assert!(!assets_without.files.contains_key("assets/bgm.mp3"));
+    }
+
+    #[test]
+    fn test_overlay_rejects_overflow_and_oversized_payload() {
+        // 1. payload_size = u64::MAX must fail cleanly without integer overflow panic
+        let mut overflow_buf = vec![0u8; 64];
+        let trailer_start = overflow_buf.len() - TRAILER_SIZE;
+        overflow_buf[trailer_start..trailer_start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        overflow_buf[trailer_start + 40..].copy_from_slice(OVERLAY_MAGIC);
+        assert!(read_overlay_from_reader(&mut Cursor::new(overflow_buf)).is_err());
+
+        // 2. payload_size = MAX_OVERLAY_SIZE + 1 must fail before allocation
+        let mut huge_buf = vec![0u8; 64];
+        let trailer_start2 = huge_buf.len() - TRAILER_SIZE;
+        huge_buf[trailer_start2..trailer_start2 + 8]
+            .copy_from_slice(&(MAX_OVERLAY_SIZE + 1).to_le_bytes());
+        huge_buf[trailer_start2 + 40..].copy_from_slice(OVERLAY_MAGIC);
+        assert!(read_overlay_from_reader(&mut Cursor::new(huge_buf)).is_err());
+    }
+
+    #[test]
+    fn test_overlay_streaming_media_formats_roundtrip() {
+        let config = PatcherConfig::default();
+        let theme_dir = tempfile::tempdir().unwrap();
+        std::fs::write(theme_dir.path().join("index.html"), b"<h1>Media</h1>").unwrap();
+        std::fs::create_dir_all(theme_dir.path().join("assets")).unwrap();
+        std::fs::write(theme_dir.path().join("assets/bg.jpg"), b"\xFF\xD8\xFF\xE0JPG").unwrap();
+        std::fs::write(theme_dir.path().join("assets/logo.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let payload = create_overlay_zip(&config, theme_dir.path()).unwrap();
+        let assets = parse_embedded_assets(&payload).unwrap();
+        assert_eq!(assets.files["assets/bg.jpg"].0, b"\xFF\xD8\xFF\xE0JPG");
+        assert_eq!(assets.files["assets/logo.png"].0, b"\x89PNG\r\n\x1a\n");
     }
 }

@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use patcher_core::config::PatcherConfig;
+use patcher_core::downloader::validate_http_url;
 use patcher_core::overlay::{append_overlay_to_file, create_overlay_zip};
-use patcher_core::pe::update_executable_icon;
+use patcher_core::patching::validate_relative_patch_path;
+use patcher_core::pe::{
+    update_executable_resources, PeVersionInfo, DEFAULT_AS_INVOKER_MANIFEST,
+};
 use patch_maker::{
     add_patch_to_plist, build_thor_patch, collect_entries_from_directory, parse_delete_list,
     FilenameEncoding, PatchEntry, ThorBuildOptions,
@@ -280,6 +284,20 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
         return Err("Output executable path cannot be empty.".to_string());
     }
 
+    // Validate configured server URLs & notice URL
+    for srv in &req.config.server.patch_servers {
+        validate_http_url(&srv.plist_url)
+            .map_err(|e| format!("Invalid plist_url for server '{}': {:#}", srv.name, e))?;
+        validate_http_url(&srv.patch_url)
+            .map_err(|e| format!("Invalid patch_url for server '{}': {:#}", srv.name, e))?;
+    }
+    if let Some(ref notice) = req.config.server.notice_url {
+        if !notice.trim().is_empty() {
+            validate_http_url(notice)
+                .map_err(|e| format!("Invalid notice_url: {:#}", e))?;
+        }
+    }
+
     // 1. Locate patcher_base.exe template
     let base_template = req
         .template_exe_path
@@ -302,6 +320,12 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
         raw_output
     };
 
+    if let (Ok(canon_base), Ok(canon_out)) = (fs::canonicalize(&base_template), fs::canonicalize(&output_path)) {
+        if canon_base == canon_out {
+            return Err("Output executable path cannot overwrite the base template binary.".to_string());
+        }
+    }
+
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -317,7 +341,7 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
         )
     })?;
 
-    // 3. (CRITICAL) Update PE Resource (icon) BEFORE appending binary overlay
+    // 3. (CRITICAL) Update PE Resources (Icon, Version Info, asInvoker Manifest) BEFORE appending binary overlay
     let icon_to_apply: Option<PathBuf> = req
         .custom_icon_path
         .as_deref()
@@ -325,12 +349,24 @@ pub fn generate_patcher(req: GeneratePatcherRequest) -> Result<GeneratePatcherRe
         .or_else(|| resolve_project_path("template-dist/default_icon.ico"))
         .or_else(|| resolve_project_path("apps/patcher-builder/src-tauri/icons/icon.ico"));
 
-    if let Some(ref ico_path) = icon_to_apply {
-        log::info!("Updating executable icon from {:?}", ico_path);
-        if let Err(e) = update_executable_icon(&output_path, ico_path) {
-            log::warn!("Warning: Failed to update PE icon ({:#}). Continuing with build.", e);
-        }
-    }
+    let output_filename = output_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Patcher.exe");
+    let version_info = PeVersionInfo::from_title_and_filename(&req.config.window.title, output_filename);
+
+    log::info!(
+        "Updating PE resources (icon: {:?}, product: {:?}) before appending overlay",
+        icon_to_apply,
+        version_info.product_name
+    );
+    update_executable_resources(
+        &output_path,
+        icon_to_apply.as_deref(),
+        Some(&version_info),
+        Some(DEFAULT_AS_INVOKER_MANIFEST),
+    )
+    .map_err(|e| format!("Failed to update PE resources: {:#}", e))?;
 
     // 4. Resolve Web Theme folder
     let theme_folder = req
@@ -383,9 +419,26 @@ pub fn create_thor_patch(req: CreateThorRequest) -> Result<CreateThorResponse, S
         req.input_dir
     );
 
-    let output_thor = Path::new(&req.output_thor_path);
+    if req.output_thor_path.trim().is_empty() {
+        return Err("Output .thor path cannot be empty.".to_string());
+    }
+
+    let output_thor = Path::new(req.output_thor_path.trim());
     let is_exe_mode = req.input_mode == "patcher_exe";
     let use_grf_merging = if is_exe_mode { false } else { req.use_grf_merging };
+
+    let validated_target_grf = if use_grf_merging {
+        match req.target_grf.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(grf) => {
+                validate_relative_patch_path(grf)
+                    .map_err(|e| format!("Invalid target GRF path: {:#}", e))?;
+                Some(grf.to_string())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let encoding = match req.filename_encoding.as_deref() {
         Some("ascii") => FilenameEncoding::Ascii,
@@ -394,11 +447,7 @@ pub fn create_thor_patch(req: CreateThorRequest) -> Result<CreateThorResponse, S
 
     let options = ThorBuildOptions {
         use_grf_merging,
-        target_grf_name: if use_grf_merging {
-            req.target_grf.filter(|s| !s.trim().is_empty())
-        } else {
-            None
-        },
+        target_grf_name: validated_target_grf,
         include_checksums: req.include_checksums,
         compression_level: req.compression_level.clamp(0, 9),
         filename_encoding: encoding,
@@ -434,11 +483,20 @@ pub fn create_thor_patch(req: CreateThorRequest) -> Result<CreateThorResponse, S
                 let target_rel = if is_exe_mode {
                     default_name
                 } else {
-                    req.single_file_target_path
-                        .as_ref()
-                        .map(|s| s.trim().to_string())
+                    match req
+                        .single_file_target_path
+                        .as_deref()
+                        .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .unwrap_or(default_name)
+                    {
+                        Some(rel) => {
+                            validate_relative_patch_path(rel).map_err(|e| {
+                                format!("Invalid target relative path {:?}: {:#}", rel, e)
+                            })?;
+                            rel.to_string()
+                        }
+                        None => default_name,
+                    }
                 };
                 entries.push(PatchEntry {
                     target_relative_path: target_rel,
@@ -460,6 +518,9 @@ pub fn create_thor_patch(req: CreateThorRequest) -> Result<CreateThorResponse, S
     for del_path in &req.delete_files {
         let trimmed = del_path.trim();
         if !trimmed.is_empty() {
+            validate_relative_patch_path(trimmed).map_err(|e| {
+                format!("Invalid delete list path {:?}: {:#}", trimmed, e)
+            })?;
             entries.push(PatchEntry {
                 target_relative_path: trimmed.to_string(),
                 is_removed: true,
@@ -504,31 +565,7 @@ pub fn create_thor_patch(req: CreateThorRequest) -> Result<CreateThorResponse, S
 
 #[tauri::command]
 pub fn open_external_url(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err("Only http:// and https:// URLs are allowed.".to_string());
-    }
-
-    let safe_url = parsed.as_str();
-    log::info!("Opening external URL: {}", safe_url);
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", safe_url])
-            .creation_flags(0x08000000)
-            .spawn()
-            .map_err(|e| format!("Failed to launch browser: {:#}", e))?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(safe_url)
-            .spawn()
-            .map_err(|e| format!("Failed to launch browser: {:#}", e))?;
-    }
-    Ok(())
+    patcher_core::launcher::open_external_url(&url).map_err(|e| format!("{:#}", e))
 }
 
 #[cfg(target_os = "windows")]
@@ -637,9 +674,28 @@ mod win32_dialog {
         OsString::from_wide(&buf[..len]).to_string_lossy().to_string()
     }
 
+    struct ComGuard(bool);
+
+    impl ComGuard {
+        unsafe fn init_apartment() -> Self {
+            let hr = CoInitializeEx(std::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
+            Self(hr >= 0)
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
     pub fn show_folder_dialog(owner_hwnd: isize, initial_dir: Option<&Path>) -> Option<String> {
         unsafe {
-            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
+            let _com_guard = ComGuard::init_apartment();
             let hwnd = if owner_hwnd != 0 {
                 owner_hwnd
             } else {
@@ -671,14 +727,12 @@ mod win32_dialog {
 
             let pidl = SHBrowseForFolderW(&mut bi);
             if pidl.is_null() {
-                CoUninitialize();
                 return None;
             }
 
             let mut path_buf = vec![0u16; 1024];
             let ok = SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr());
             CoTaskMemFree(pidl);
-            CoUninitialize();
 
             if ok != 0 {
                 let s = from_wide_buf(&path_buf);
@@ -699,7 +753,7 @@ mod win32_dialog {
         initial_path: Option<&Path>,
     ) -> Result<Option<String>, String> {
         unsafe {
-            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
+            let _com_guard = ComGuard::init_apartment();
             let hwnd = if owner_hwnd != 0 {
                 owner_hwnd
             } else {
@@ -787,14 +841,11 @@ mod win32_dialog {
                     if res == 0 {
                         let err_code2 = CommDlgExtendedError();
                         if err_code2 != 0 {
-                            CoUninitialize();
                             return Err(format!("Common dialog error code: 0x{:X}", err_code2));
                         }
                     }
                 }
             }
-
-            CoUninitialize();
 
             if res != 0 {
                 let s = from_wide_buf(&file_buf);
@@ -997,5 +1048,77 @@ mod tests {
         let missing = inspect_theme_dir(&without_bgm.0.join("does-not-exist"));
         assert!(!missing.exists);
         assert!(!missing.has_bgm);
+    }
+
+    #[test]
+    fn test_create_thor_patch_rejects_traversal() {
+        let dir = TempDirGuard::new("thor_traversal");
+        let dummy_file = dir.0.join("item.txt");
+        fs::write(&dummy_file, b"ok").unwrap();
+        let out_thor = dir.0.join("out.thor");
+
+        // 1. Reject traversal in target_grf
+        let res_grf = create_thor_patch(CreateThorRequest {
+            input_mode: "single_file".to_string(),
+            input_dir: dummy_file.to_string_lossy().to_string(),
+            single_file_target_path: None,
+            output_thor_path: out_thor.to_string_lossy().to_string(),
+            use_grf_merging: true,
+            target_grf: Some("..\\..\\escape.grf".to_string()),
+            include_checksums: true,
+            compression_level: 9,
+            filename_encoding: None,
+            delete_files: vec![],
+            update_plist_path: None,
+            forced_patch_index: None,
+        });
+        assert!(res_grf.is_err());
+
+        // 2. Reject traversal in single_file_target_path
+        let res_single = create_thor_patch(CreateThorRequest {
+            input_mode: "single_file".to_string(),
+            input_dir: dummy_file.to_string_lossy().to_string(),
+            single_file_target_path: Some("..\\..\\evil.dll".to_string()),
+            output_thor_path: out_thor.to_string_lossy().to_string(),
+            use_grf_merging: false,
+            target_grf: None,
+            include_checksums: true,
+            compression_level: 9,
+            filename_encoding: None,
+            delete_files: vec![],
+            update_plist_path: None,
+            forced_patch_index: None,
+        });
+        assert!(res_single.is_err());
+
+        // 3. Reject traversal in delete_files
+        let res_del = create_thor_patch(CreateThorRequest {
+            input_mode: "delete_only".to_string(),
+            input_dir: String::new(),
+            single_file_target_path: None,
+            output_thor_path: out_thor.to_string_lossy().to_string(),
+            use_grf_merging: false,
+            target_grf: None,
+            include_checksums: true,
+            compression_level: 9,
+            filename_encoding: None,
+            delete_files: vec!["..\\Windows\\win.ini".to_string()],
+            update_plist_path: None,
+            forced_patch_index: None,
+        });
+        assert!(res_del.is_err());
+    }
+
+    #[test]
+    fn test_open_external_url_rejects_unsafe_schemes() {
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/cmd.exe",
+            "ms-msdt:id",
+            "https://example.com/\"bad\"",
+        ] {
+            assert!(open_external_url(bad.to_string()).is_err());
+        }
     }
 }

@@ -1,5 +1,6 @@
 use std::boxed::Box;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,6 +14,7 @@ use crc::crc32;
 use encoding::label::encoding_from_whatwg_label;
 use encoding::DecoderTrap;
 use flate2::read::ZlibDecoder;
+use nom::error::ErrorKind;
 use nom::number::complete::{le_i16, le_i32, le_u32, le_u8};
 use nom::*;
 
@@ -20,6 +22,11 @@ use nom::*;
 const MAX_FILE_NAME_SIZE: usize = 256;
 const HEADER_MAX_SIZE: usize = THOR_HEADER_MAGIC.len() + 0x8 + MAX_FILE_NAME_SIZE;
 const SINGLE_FILE_ENTRY_MAX_SIZE: usize = 9 + MAX_FILE_NAME_SIZE;
+
+// Defensive bounds for untrusted archive headers/tables/entries
+const MAX_THOR_TABLE_COMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+const MAX_THOR_TABLE_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+const MAX_THOR_ENTRY_SIZE: usize = 512 * 1024 * 1024;
 
 pub type ThorPatchList = Vec<ThorPatchInfo>;
 
@@ -63,18 +70,11 @@ impl ThorPatchInfo {
 }
 
 fn parse_data_integrity_info(data: &str) -> HashMap<&str, u32> {
-    let vec_lines: Vec<_> = data.lines().collect();
-    vec_lines
-        .into_iter()
+    data.lines()
         .filter_map(|line| {
-            let words: Vec<&str> = line.trim().split('=').collect();
-            let file_name = words.get(0)?;
-            let hash_str = words.get(1)?;
-            let hash = match u32::from_str_radix(hash_str.trim_start_matches("0x"), 16) {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            Some((*file_name, hash))
+            let (file_name, hash_str) = line.trim().rsplit_once('=')?;
+            let hash = u32::from_str_radix(hash_str.trim().trim_start_matches("0x"), 16).ok()?;
+            Some((file_name, hash))
         })
         .collect()
 }
@@ -122,11 +122,27 @@ impl<R: Read + Seek> ThorArchive<R> {
         if file_entry.size_compressed == 0 {
             return Ok(vec![]);
         }
+        if file_entry.size_compressed > MAX_THOR_ENTRY_SIZE || file_entry.size > MAX_THOR_ENTRY_SIZE
+        {
+            return Err(GrufError::parsing_error(
+                "THOR entry size exceeds maximum allowed limit",
+            ));
+        }
+
+        let stream_len = self.obj.seek(SeekFrom::End(0))?;
+        let entry_end = file_entry
+            .offset
+            .checked_add(file_entry.size_compressed as u64)
+            .ok_or_else(|| GrufError::parsing_error("THOR entry offset overflow"))?;
+        if entry_end > stream_len {
+            return Err(GrufError::parsing_error(
+                "THOR entry extends past end of archive",
+            ));
+        }
 
         self.obj.seek(SeekFrom::Start(file_entry.offset))?;
-        let mut content: Vec<u8> = Vec::with_capacity(file_entry.size_compressed);
-        let mut file_chunk = self.obj.by_ref().take(content.capacity() as u64);
-        file_chunk.read_to_end(&mut content)?;
+        let mut content = vec![0u8; file_entry.size_compressed];
+        self.obj.read_exact(&mut content)?;
         Ok(content)
     }
 
@@ -136,17 +152,40 @@ impl<R: Read + Seek> ThorArchive<R> {
             .ok_or(GrufError::EntryNotFound)?
             .clone();
         if file_entry.size_compressed == 0 {
+            if file_entry.size != 0 {
+                return Err(GrufError::parsing_error(
+                    "THOR entry has zero compressed size for non-empty payload",
+                ));
+            }
             return Ok(vec![]);
+        }
+        if file_entry.size_compressed > MAX_THOR_ENTRY_SIZE || file_entry.size > MAX_THOR_ENTRY_SIZE
+        {
+            return Err(GrufError::parsing_error(
+                "THOR entry size exceeds maximum allowed limit",
+            ));
+        }
+
+        let stream_len = self.obj.seek(SeekFrom::End(0))?;
+        let entry_end = file_entry
+            .offset
+            .checked_add(file_entry.size_compressed as u64)
+            .ok_or_else(|| GrufError::parsing_error("THOR entry offset overflow"))?;
+        if entry_end > stream_len {
+            return Err(GrufError::parsing_error(
+                "THOR entry extends past end of archive",
+            ));
         }
 
         self.obj.seek(SeekFrom::Start(file_entry.offset))?;
-        let mut content: Vec<u8> = Vec::with_capacity(file_entry.size_compressed);
-        let mut file_chunk = self.obj.by_ref().take(content.capacity() as u64);
-        file_chunk.read_to_end(&mut content)?;
-        // Decompress the content with zlib
-        let mut decoder = ZlibDecoder::new(content.as_slice());
-        let mut decompressed_content = Vec::new();
-        let decompressed_size = decoder.read_to_end(&mut decompressed_content)?;
+        let mut content = vec![0u8; file_entry.size_compressed];
+        self.obj.read_exact(&mut content)?;
+        // Decompress the content with zlib (bounded to declared size + 1 to detect bombs)
+        let decoder = ZlibDecoder::new(content.as_slice());
+        let mut decompressed_content = Vec::with_capacity(file_entry.size.min(16 * 1024 * 1024));
+        let decompressed_size = decoder
+            .take(file_entry.size as u64 + 1)
+            .read_to_end(&mut decompressed_content)?;
         if decompressed_size != file_entry.size {
             return Err(GrufError::parsing_error(
                 "Decompressed content is not as expected",
@@ -175,9 +214,24 @@ impl<R: Read + Seek> ThorArchive<R> {
 
     /// Checks if the container has been unintentionnaly corrupted
     pub fn is_valid(&mut self) -> Result<bool> {
+        let required_entries: Vec<String> = self
+            .container
+            .entries
+            .values()
+            .filter(|e| !e.is_internal() && !e.is_removed)
+            .map(|e| e.relative_path.clone())
+            .collect();
+
         let integrity_data = self.read_file_content(INTEGRITY_FILE_NAME)?;
         let integrity_data_as_str = string_from_win_1252(integrity_data.as_slice())?;
         let integrity_info = parse_data_integrity_info(integrity_data_as_str.as_str());
+
+        for rel_path in &required_entries {
+            if !integrity_info.contains_key(rel_path.as_str()) {
+                return Ok(false);
+            }
+        }
+
         for (file_path, hash) in integrity_info {
             let file_content = match self.read_file_content(file_path) {
                 Ok(v) => v,
@@ -290,13 +344,27 @@ named!(parse_single_file_table<&[u8], SingleFileTableDesc>,
     )
 ));
 
+fn parse_non_negative_usize(input: &[u8]) -> IResult<&[u8], usize> {
+    let (rest, val) = le_i32(input)?;
+    let non_neg =
+        usize::try_from(val).map_err(|_| nom::Err::Failure((input, ErrorKind::Verify)))?;
+    Ok((rest, non_neg))
+}
+
+fn parse_non_negative_u64(input: &[u8]) -> IResult<&[u8], u64> {
+    let (rest, val) = le_i32(input)?;
+    let non_neg =
+        u64::try_from(val).map_err(|_| nom::Err::Failure((input, ErrorKind::Verify)))?;
+    Ok((rest, non_neg))
+}
+
 named!(parse_multiple_files_table<&[u8], MultipleFilesTableDesc>,
     do_parse!(
-        file_table_compressed_size: le_i32
-        >> file_table_offset: le_i32
+        file_table_compressed_size: parse_non_negative_usize
+        >> file_table_offset: parse_non_negative_u64
         >> (MultipleFilesTableDesc {
-            file_table_compressed_size: file_table_compressed_size as usize,
-            file_table_offset: file_table_offset as u64, // Offset in the 'data' field
+            file_table_compressed_size,
+            file_table_offset, // Offset in the 'data' field
         }
     )
 ));
@@ -322,13 +390,13 @@ macro_rules! take_string_ansi (
 
 named!(parse_single_file_entry<&[u8], ThorFileEntry>,
     do_parse!(
-        size_compressed: le_i32
-        >> size: le_i32
+        size_compressed: parse_non_negative_usize
+        >> size: parse_non_negative_usize
         >> relative_path_size: le_u8
         >> relative_path: take_string_ansi!(relative_path_size)
         >> (ThorFileEntry {
-            size_compressed: size_compressed as usize,
-            size: size as usize,
+            size_compressed,
+            size,
             relative_path,
             is_removed: false,
             offset: 0, // This field is set outside the parser
@@ -357,11 +425,11 @@ named!(parse_multiple_files_entry<&[u8], ThorFileEntry>,
         >> relative_path: take_string_ansi!(relative_path_size)
         >> flags: le_u8
         >> offset: take_if_not_removed!(le_u32, flags)
-        >> size_compressed: take_if_not_removed!(le_i32, flags)
-        >> size: take_if_not_removed!(le_i32, flags)
+        >> size_compressed: take_if_not_removed!(parse_non_negative_usize, flags)
+        >> size: take_if_not_removed!(parse_non_negative_usize, flags)
         >> (ThorFileEntry {
-            size_compressed: size_compressed as usize,
-            size: size as usize,
+            size_compressed,
+            size,
             relative_path,
             is_removed: is_file_removed(flags),
             offset: offset as u64,
@@ -379,6 +447,9 @@ named!(parse_multiple_files_entries<&[u8], HashMap<String, ThorFileEntry>>,
 pub fn parse_thor_patch<R: Seek + Read>(reader: &mut R) -> Result<ThorContainer> {
     const HEADER_EXTENDED_MAX_SIZE: usize =
         HEADER_MAX_SIZE + MULTIPLE_FILES_TABLE_DESC_SIZE + SINGLE_FILE_ENTRY_MAX_SIZE;
+    let stream_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
     let mut thor_header_buf = Vec::with_capacity(HEADER_EXTENDED_MAX_SIZE);
     let mut reader_chunk = reader.take(thor_header_buf.capacity() as u64);
     reader_chunk.read_to_end(&mut thor_header_buf)?;
@@ -407,18 +478,37 @@ pub fn parse_thor_patch<R: Seek + Read>(reader: &mut R) -> Result<ThorContainer>
             let (output, table) = parse_multiple_files_table(output)
                 .map_err(|_| GrufError::parsing_error("Failed to parse THOR file table"))?;
             let consumed_bytes = output.as_ptr() as u64 - thor_header_buf.as_ptr() as u64;
-            if table.file_table_offset < consumed_bytes {
+            if table.file_table_offset < consumed_bytes || table.file_table_offset > stream_len {
                 return Err(GrufError::parsing_error("Invalid THOR file table offset"));
             }
-            // Decompress the table with zlib
+            if table.file_table_compressed_size > MAX_THOR_TABLE_COMPRESSED_SIZE {
+                return Err(GrufError::parsing_error(
+                    "THOR file table compressed size exceeds maximum allowed size",
+                ));
+            }
+            let table_end = table
+                .file_table_offset
+                .checked_add(table.file_table_compressed_size as u64)
+                .ok_or_else(|| GrufError::parsing_error("THOR file table offset overflow"))?;
+            if table_end > stream_len {
+                return Err(GrufError::parsing_error(
+                    "THOR file table extends past end of archive",
+                ));
+            }
+            // Decompress the table with zlib (bounded)
             reader.seek(SeekFrom::Start(table.file_table_offset))?;
-            let mut compressed_table: Vec<u8> =
-                Vec::with_capacity(table.file_table_compressed_size);
-            let mut file_chunk = reader.take(compressed_table.capacity() as u64);
-            file_chunk.read_to_end(&mut compressed_table)?;
-            let mut decoder = ZlibDecoder::new(compressed_table.as_slice());
-            let mut decompressed_table = vec![];
-            let decompressed_size = decoder.read_to_end(&mut decompressed_table)?;
+            let mut compressed_table = vec![0u8; table.file_table_compressed_size];
+            reader.read_exact(&mut compressed_table)?;
+            let decoder = ZlibDecoder::new(compressed_table.as_slice());
+            let mut decompressed_table = Vec::new();
+            let decompressed_size = decoder
+                .take(MAX_THOR_TABLE_DECOMPRESSED_SIZE as u64 + 1)
+                .read_to_end(&mut decompressed_table)?;
+            if decompressed_size > MAX_THOR_TABLE_DECOMPRESSED_SIZE {
+                return Err(GrufError::parsing_error(
+                    "THOR file table exceeds maximum allowed size",
+                ));
+            }
             // Parse multiple entries
             let entries = match decompressed_size {
                 0 => HashMap::new(), // No entries
@@ -576,5 +666,124 @@ mod tests {
             assert!(thor_archive.use_grf_merging());
             assert!(thor_archive.is_valid().unwrap());
         }
+    }
+
+    #[test]
+    fn test_thor_bounds_and_integrity_hardening() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Cursor;
+
+        // 1. Negative file_table_compressed_size in MultipleFiles table
+        let mut neg_table = Vec::new();
+        neg_table.extend_from_slice(THOR_HEADER_MAGIC);
+        neg_table.push(0); // use_grf_merging
+        neg_table.extend_from_slice(&1u32.to_le_bytes()); // file_count
+        neg_table.extend_from_slice(&48i16.to_le_bytes()); // MultipleFiles
+        neg_table.push(0); // target_grf_name_size
+        neg_table.extend_from_slice(&(-1i32).to_le_bytes()); // file_table_compressed_size = -1
+        neg_table.extend_from_slice(&64i32.to_le_bytes()); // file_table_offset
+        assert!(ThorArchive::new(Cursor::new(neg_table)).is_err());
+
+        // 2. Negative size_compressed in SingleFile entry
+        let mut neg_single = Vec::new();
+        neg_single.extend_from_slice(THOR_HEADER_MAGIC);
+        neg_single.push(0);
+        neg_single.extend_from_slice(&1u32.to_le_bytes());
+        neg_single.extend_from_slice(&33i16.to_le_bytes()); // SingleFile
+        neg_single.push(0); // target_grf_name_size
+        neg_single.push(0); // single file table byte
+        neg_single.extend_from_slice(&(-5i32).to_le_bytes()); // size_compressed = -5
+        neg_single.extend_from_slice(&10i32.to_le_bytes()); // size
+        neg_single.push(4);
+        neg_single.extend_from_slice(b"a.tx");
+        assert!(ThorArchive::new(Cursor::new(neg_single)).is_err());
+
+        // 3. Declared file_table_compressed_size extending past EOF
+        let mut oob_table = Vec::new();
+        oob_table.extend_from_slice(THOR_HEADER_MAGIC);
+        oob_table.push(0);
+        oob_table.extend_from_slice(&1u32.to_le_bytes());
+        oob_table.extend_from_slice(&48i16.to_le_bytes());
+        oob_table.push(0);
+        let offset = (oob_table.len() + 8) as i32;
+        oob_table.extend_from_slice(&9999i32.to_le_bytes());
+        oob_table.extend_from_slice(&offset.to_le_bytes());
+        oob_table.extend_from_slice(&[0u8; 4]);
+        assert!(ThorArchive::new(Cursor::new(oob_table)).is_err());
+
+        // 4. Zlib bomb: compressed stream decompresses to more bytes than declared entry size
+        let mut bomb_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        bomb_encoder.write_all(&[b'A'; 1024]).unwrap();
+        let bomb_compressed = bomb_encoder.finish().unwrap();
+
+        let mut bomb_thor = Vec::new();
+        bomb_thor.extend_from_slice(THOR_HEADER_MAGIC);
+        bomb_thor.push(0);
+        bomb_thor.extend_from_slice(&1u32.to_le_bytes());
+        bomb_thor.extend_from_slice(&33i16.to_le_bytes());
+        bomb_thor.push(0);
+        bomb_thor.push(0);
+        bomb_thor.extend_from_slice(&(bomb_compressed.len() as i32).to_le_bytes());
+        bomb_thor.extend_from_slice(&4i32.to_le_bytes()); // claim only 4 bytes!
+        bomb_thor.push(8);
+        bomb_thor.extend_from_slice(b"bomb.txt");
+        bomb_thor.extend_from_slice(&bomb_compressed);
+        let mut bomb_arch = ThorArchive::new(Cursor::new(bomb_thor)).unwrap();
+        assert!(bomb_arch.read_file_content("bomb.txt").is_err());
+
+        // 5. Completeness check in is_valid(): entry omitted from data.integrity must return Ok(false)
+        let mut payload_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        payload_enc.write_all(b"verified").unwrap();
+        let c1 = payload_enc.finish().unwrap();
+
+        let mut smuggled_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        smuggled_enc.write_all(b"evil").unwrap();
+        let c2 = smuggled_enc.finish().unwrap();
+
+        let integrity_line = format!("ok.txt=0x{:08x}\r\n", crc32::checksum_ieee(b"verified"));
+        let mut integ_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        integ_enc.write_all(integrity_line.as_bytes()).unwrap();
+        let c_integ = integ_enc.finish().unwrap();
+
+        let mut buf = vec![0u8; THOR_HEADER_MAGIC.len() + 8 + 8];
+        let off1 = buf.len() as u32;
+        buf.extend_from_slice(&c1);
+        let off2 = buf.len() as u32;
+        buf.extend_from_slice(&c2);
+        let off_integ = buf.len() as u32;
+        buf.extend_from_slice(&c_integ);
+
+        let mut raw_tbl = Vec::new();
+        for (name, off, csz, sz) in [
+            ("ok.txt", off1, c1.len(), 8usize),
+            ("smuggled.exe", off2, c2.len(), 4usize),
+            (INTEGRITY_FILE_NAME, off_integ, c_integ.len(), integrity_line.len()),
+        ] {
+            raw_tbl.push(name.len() as u8);
+            raw_tbl.extend_from_slice(name.as_bytes());
+            raw_tbl.push(0); // flags
+            raw_tbl.extend_from_slice(&off.to_le_bytes());
+            raw_tbl.extend_from_slice(&(csz as i32).to_le_bytes());
+            raw_tbl.extend_from_slice(&(sz as i32).to_le_bytes());
+        }
+        let mut tbl_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        tbl_enc.write_all(&raw_tbl).unwrap();
+        let c_tbl = tbl_enc.finish().unwrap();
+        let tbl_off = buf.len() as i32;
+        buf.extend_from_slice(&c_tbl);
+
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(THOR_HEADER_MAGIC);
+        hdr.push(0);
+        hdr.extend_from_slice(&3u32.to_le_bytes());
+        hdr.extend_from_slice(&48i16.to_le_bytes());
+        hdr.push(0);
+        hdr.extend_from_slice(&(c_tbl.len() as i32).to_le_bytes());
+        hdr.extend_from_slice(&tbl_off.to_le_bytes());
+        buf[..hdr.len()].copy_from_slice(&hdr);
+
+        let mut smuggled_arch = ThorArchive::new(Cursor::new(buf)).unwrap();
+        assert!(!smuggled_arch.is_valid().unwrap());
     }
 }

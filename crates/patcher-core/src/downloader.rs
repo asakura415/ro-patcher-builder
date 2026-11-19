@@ -8,11 +8,86 @@ use futures::stream::{StreamExt, TryStreamExt};
 use gruf::thor::ThorArchive;
 use gruf::GrufError;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use url::Url;
 
 use crate::config::PatchServerInfo;
+use crate::patching::is_windows_reserved_device_name;
 use crate::plist::{parse_patch_list, PatchItem};
+
+const MAX_PLIST_BYTES: usize = 10 * 1024 * 1024;
+
+/// Validates that `raw` is a syntactically valid `http://` or `https://` URL with a non-empty host.
+pub fn validate_http_url(raw: &str) -> Result<Url> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("URL cannot be empty");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    match after_scheme {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => bail!("URL must start with http:// or https:// and include a valid host: {}", raw),
+    }
+
+    let parsed = Url::parse(trimmed).with_context(|| format!("Invalid URL: {}", raw))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("Unsupported URL scheme {:?} (only http:// and https:// are allowed)", parsed.scheme());
+    }
+    if parsed.host_str().map_or(true, |h| h.is_empty()) {
+        bail!("URL is missing a valid host: {}", raw);
+    }
+    Ok(parsed)
+}
+
+/// Validates a relative patch filename from `plist.txt` against path traversal,
+/// scheme/drive injection, backslashes, and Windows reserved device names.
+pub fn validate_patch_file_name(name: &str) -> Result<&str> {
+    if name.trim().is_empty() {
+        bail!("Patch file name cannot be empty");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        bail!("Patch file name contains control characters: {:?}", name);
+    }
+    if name.contains('\\') || name.contains(':') || name.starts_with('/') || name.contains("//") {
+        bail!("Disallowed characters or path prefix in patch file name: {:?}", name);
+    }
+
+    for seg in name.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            bail!("Invalid path segment {:?} in patch file name {:?}", seg, name);
+        }
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            bail!("Trailing dot or space not allowed in patch file name {:?}", name);
+        }
+        if is_windows_reserved_device_name(seg) {
+            bail!("Windows reserved device name not allowed in patch file name {:?}", name);
+        }
+    }
+
+    Ok(name)
+}
+
+/// Resolves a validated patch file name against `base_url`, ensuring same-origin HTTP(S).
+pub fn resolve_patch_download_url(base_url: &Url, file_name: &str) -> Result<Url> {
+    let safe_name = validate_patch_file_name(file_name)?;
+    let resolved = base_url
+        .join(safe_name)
+        .with_context(|| format!("Invalid URL for patch file: {}", file_name))?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        bail!("Resolved patch URL uses disallowed scheme: {}", resolved.scheme());
+    }
+    if resolved.origin() != base_url.origin() {
+        bail!(
+            "Patch file URL {:?} escapes configured server origin {:?}",
+            resolved.as_str(),
+            base_url.origin().ascii_serialization()
+        );
+    }
+    Ok(resolved)
+}
 
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -83,17 +158,18 @@ async fn probe_server(
     client: &reqwest::Client,
     server: &PatchServerInfo,
 ) -> Result<(Vec<PatchItem>, Url)> {
-    let plist_url = Url::parse(server.plist_url.trim())
+    let plist_url = validate_http_url(&server.plist_url)
         .with_context(|| format!("Invalid plist_url: {}", server.plist_url))?;
-    let normalized_patch_url = if server.patch_url.trim().ends_with('/') {
-        server.patch_url.trim().to_string()
+    let trimmed_patch = server.patch_url.trim();
+    let normalized_patch_url = if trimmed_patch.ends_with('/') {
+        trimmed_patch.to_string()
     } else {
-        format!("{}/", server.patch_url.trim())
+        format!("{}/", trimmed_patch)
     };
-    let patch_url = Url::parse(&normalized_patch_url)
+    let patch_url = validate_http_url(&normalized_patch_url)
         .with_context(|| format!("Invalid patch_url: {}", server.patch_url))?;
 
-    let resp = client
+    let mut resp = client
         .get(plist_url.clone())
         .timeout(Duration::from_secs(5))
         .send()
@@ -104,14 +180,39 @@ async fn probe_server(
         bail!("Failed to get plist from {}: HTTP {}", plist_url, resp.status());
     }
 
-    let text = resp.text().await?;
+    if let Some(content_len) = resp.content_length() {
+        if content_len > MAX_PLIST_BYTES as u64 {
+            bail!(
+                "Patch list from {} exceeds maximum size ({} bytes)",
+                plist_url,
+                MAX_PLIST_BYTES
+            );
+        }
+    }
+
+    let mut plist_bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("Failed reading plist from {}", plist_url))?
+    {
+        if plist_bytes.len().saturating_add(chunk.len()) > MAX_PLIST_BYTES {
+            bail!(
+                "Patch list from {} exceeds maximum allowed size ({} bytes)",
+                plist_url,
+                MAX_PLIST_BYTES
+            );
+        }
+        plist_bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&plist_bytes);
     let patch_list = parse_patch_list(&text);
 
     // If there is at least one patch, verify that patch_url can reach it
     if let Some(first_patch) = patch_list.first() {
-        let first_patch_url = patch_url.join(&first_patch.file_name)?;
+        let first_patch_url = resolve_patch_download_url(&patch_url, &first_patch.file_name)?;
         let head_resp = client
-            .head(first_patch_url.clone())
+            .head(first_patch_url)
             .timeout(Duration::from_secs(5))
             .send()
             .await;
@@ -150,44 +251,43 @@ where
     let downloaded_bytes_recent = Arc::new(AtomicU64::new(0));
     let current_speed_bps = Arc::new(AtomicU64::new(0));
     let active_file_name = Arc::new(std::sync::Mutex::new(String::new()));
-    let last_speed_check = Arc::new(tokio::sync::Mutex::new(Instant::now()));
 
     // Spawn a background timer task to report download speed every 500ms
     let speed_completed = completed_count.clone();
     let speed_bytes = downloaded_bytes_recent.clone();
     let speed_bps_store = current_speed_bps.clone();
     let speed_active_file = active_file_name.clone();
-    let speed_time = last_speed_check.clone();
     let speed_callback = progress_callback.clone();
     let speed_cancel = cancel_signal.clone();
 
     let speed_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.tick().await;
+        let mut last_tick = Instant::now();
+
         while !speed_cancel.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let mut time_lock = speed_time.lock().await;
-            let elapsed = time_lock.elapsed();
-            if elapsed >= Duration::from_millis(500) {
-                let bytes = speed_bytes.swap(0, Ordering::Relaxed);
-                let speed = if elapsed.as_secs_f64() > 0.0 {
-                    (bytes as f64 / elapsed.as_secs_f64()).round() as u64
-                } else {
-                    0
-                };
-                speed_bps_store.store(speed, Ordering::Relaxed);
-                *time_lock = Instant::now();
+            interval.tick().await;
+            let elapsed = last_tick.elapsed();
+            let bytes = speed_bytes.swap(0, Ordering::Relaxed);
+            let speed = if elapsed.as_secs_f64() > 0.0 {
+                (bytes as f64 / elapsed.as_secs_f64()).round() as u64
+            } else {
+                0
+            };
+            speed_bps_store.store(speed, Ordering::Relaxed);
+            last_tick = Instant::now();
 
-                let current_file = speed_active_file
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+            let current_file = speed_active_file
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
 
-                speed_callback(DownloadProgress {
-                    downloaded_files: speed_completed.load(Ordering::Relaxed),
-                    total_files,
-                    bytes_per_sec: speed,
-                    current_file,
-                });
-            }
+            speed_callback(DownloadProgress {
+                downloaded_files: speed_completed.load(Ordering::Relaxed),
+                total_files,
+                bytes_per_sec: speed,
+                current_file,
+            });
         }
     });
 
@@ -213,41 +313,50 @@ where
                 *guard = item.file_name.clone();
             }
 
-            let file_url = base_url.join(&item.file_name)
-                .with_context(|| format!("Invalid URL for patch file: {}", item.file_name))?;
-            let local_path = dest_dir.join(&item.file_name);
+            let file_url = resolve_patch_download_url(&base_url, &item.file_name)?;
+            let local_path = dest_dir.join(format!("patch_{:010}.thor", item.index));
 
-            // Stream download to temporary or target file
-            let mut file = File::create(&local_path).await
-                .with_context(|| format!("Failed to create local patch file: {:?}", local_path))?;
+            let download_res: Result<()> = async {
+                let file = File::create(&local_path).await
+                    .with_context(|| format!("Failed to create local patch file: {:?}", local_path))?;
+                let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
-            let mut resp = client.get(file_url).send().await
-                .with_context(|| format!("Failed to request patch: {}", item.file_name))?;
+                let mut resp = client.get(file_url).send().await
+                    .with_context(|| format!("Failed to request patch: {}", item.file_name))?;
 
-            if !resp.status().is_success() {
-                bail!("Failed to download {}: HTTP {}", item.file_name, resp.status());
-            }
-
-            while let Some(chunk) = resp.chunk().await
-                .with_context(|| format!("Failed reading chunk for {}", item.file_name))?
-            {
-                if cancel.load(Ordering::Relaxed) {
-                    bail!("Download cancelled.");
+                if !resp.status().is_success() {
+                    bail!("Failed to download {}: HTTP {}", item.file_name, resp.status());
                 }
 
-                file.write_all(&chunk).await
-                    .with_context(|| format!("Failed writing chunk for {}", item.file_name))?;
+                while let Some(chunk) = resp.chunk().await
+                    .with_context(|| format!("Failed reading chunk for {}", item.file_name))?
+                {
+                    if cancel.load(Ordering::Relaxed) {
+                        bail!("Download cancelled.");
+                    }
 
-                bytes_tracker.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    writer.write_all(&chunk).await
+                        .with_context(|| format!("Failed writing chunk for {}", item.file_name))?;
+
+                    bytes_tracker.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+
+                writer.flush().await?;
+                drop(writer);
+
+                // Verify integrity if requested
+                if ensure_integrity {
+                    validate_thor_archive(&local_path)
+                        .with_context(|| format!("Integrity check failed for {}", item.file_name))?;
+                }
+
+                Ok(())
             }
+            .await;
 
-            file.flush().await?;
-            file.sync_all().await?;
-
-            // Verify integrity if requested
-            if ensure_integrity {
-                validate_thor_archive(&local_path)
-                    .with_context(|| format!("Integrity check failed for {}", item.file_name))?;
+            if let Err(err) = download_res {
+                let _ = tokio::fs::remove_file(&local_path).await;
+                return Err(err);
             }
 
             let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
@@ -290,5 +399,55 @@ fn validate_thor_archive(path: &Path) -> Result<()> {
             Ok(())
         }
         Err(e) => bail!("Failed to verify THOR integrity: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_http_url() {
+        assert!(validate_http_url("https://patch.example.com/plist.txt").is_ok());
+        assert!(validate_http_url("http://127.0.0.1:8080/patch/").is_ok());
+
+        for bad in ["", "ftp://example.com/a", "file:///C:/plist.txt", "javascript:alert(1)", "http://"] {
+            assert!(validate_http_url(bad).is_err(), "Expected {:?} to fail", bad);
+        }
+    }
+
+    #[test]
+    fn test_validate_patch_file_name_and_resolve_url() {
+        let base = Url::parse("https://cdn.example.com/patches/").unwrap();
+        assert_eq!(
+            resolve_patch_download_url(&base, "001_welcome.thor").unwrap().as_str(),
+            "https://cdn.example.com/patches/001_welcome.thor"
+        );
+        assert_eq!(
+            resolve_patch_download_url(&base, "2026/002_event.thor").unwrap().as_str(),
+            "https://cdn.example.com/patches/2026/002_event.thor"
+        );
+
+        for bad in [
+            "",
+            "../secret.thor",
+            "2026/../secret.thor",
+            "C:\\evil.thor",
+            "sub\\001.thor",
+            "/root.thor",
+            "//evil.com/x.thor",
+            "https://evil.com/x.thor",
+            "NUL",
+            "patches/CON.thor",
+            "patch.thor.",
+            "patch.thor ",
+            "bad\n.thor",
+        ] {
+            assert!(
+                resolve_patch_download_url(&base, bad).is_err(),
+                "Expected {:?} to be rejected",
+                bad
+            );
+        }
     }
 }
